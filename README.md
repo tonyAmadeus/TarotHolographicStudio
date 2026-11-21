@@ -40,7 +40,7 @@ pip install -r requirements.txt
 # 如需本机 NVIDIA CUDA GPU 加速或 Depth-Anything-V2-Large：
 # pip install torch torchvision transformers
 ```
-> 若本机已将 `depth-anything/Depth-Anything-V2-Large-hf` 下载至 `D:\AI\AllModel\Depth-Anything-V2-Large-hf`（或通过环境变量 `TAROT_LARGE_DEPTH_DIR` 指定路径），程序会自动检测并启用 FP16 CUDA GPU 加速。
+> 若本机已将 `depth-anything/Depth-Anything-V2-Large-hf` 下载至 通过环境变量 `TAROT_LARGE_DEPTH_DIR` 指定路径），程序会自动检测并启用 FP16 CUDA GPU 加速。
 
 #### 2. 运行桌面端
 - **Tauri v2 开发模式**（需安装 Node.js / pnpm 与 Rust 工具链）：
