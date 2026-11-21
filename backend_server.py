@@ -50,10 +50,12 @@ from card_templates import (
     FG_TEMPLATE_META,
     STUDIO_BG_META,
     ensure_default_templates,
+    load_depth_map_f32,
 )
 from depth_estimator import generate_depth_from_image, is_ai_depth_available
 from render_sar_card import render_3layer_sar_gif, render_live_preview_frame
 from render_tarot_holographic import (
+    GIF_QUALITY_PRESETS,
     METAL_META,
     METAL_PALETTES,
     PATTERN_META,
@@ -280,7 +282,22 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if path == "/api/file":
             fpath = qs.get("path", [""])[0]
+            as_depth = qs.get("as_depth", ["0"])[0] == "1"
             if fpath and os.path.isfile(fpath):
+                if as_depth:
+                    try:
+                        d_f32, _ = load_depth_map_f32(fpath)
+                        d_max = float(d_f32.max())
+                        if d_max > 1e-5:
+                            d_vis = np.clip(d_f32 / d_max * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                        else:
+                            d_vis = np.zeros(d_f32.shape, dtype=np.uint8)
+                        buf = io.BytesIO()
+                        Image.fromarray(d_vis, mode="L").save(buf, format="PNG")
+                        self._send_bytes(buf.getvalue(), "image/png")
+                        return
+                    except Exception:
+                        pass
                 ctype, _ = mimetypes.guess_type(fpath)
                 with open(fpath, "rb") as f:
                     data = f.read()
@@ -339,10 +356,15 @@ class APIHandler(BaseHTTPRequestHandler):
                         metal=str(body.get("metal", "auto")),
                         intensity=str(body.get("intensity", "medium")),
                         bg_mode=str(body.get("bg_mode", "auto")),
+                        depth_engine=str(body.get("depth_engine", "auto")),
                         line_etch=str(body.get("line_etch", "medium")),
                         quicksand_strength=float(body.get("quicksand_strength", 1.0)),
                         relief_strength=float(body.get("relief_strength", 1.0)),
                         enable_dof=bool(body.get("enable_dof", True)),
+                        subject_scale=float(body.get("subject_scale", 1.0)),
+                        subject_offset_x=float(body.get("subject_offset_x", 0.0)),
+                        subject_offset_y=float(body.get("subject_offset_y", 0.0)),
+                        card_aspect=str(body.get("card_aspect", "auto")),
                     )
                 im: Image.Image = res["preview_image"]
                 buf = io.BytesIO()
@@ -357,6 +379,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     "fg_source": res["fg_source"],
                     "studio_source": res["studio_source"],
                     "depth_source": res["depth_source"],
+                    "subject_size": list(res.get("subject_size", (0, 0))),
+                    "output_size": list(res.get("output_size", (0, 0))),
                 })
             except Exception as exc:
                 self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -436,7 +460,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 "intensity": str(body.get("intensity", "medium")),
                 "bg_mode": str(body.get("bg_mode", "auto")),
                 "line_etch": str(body.get("line_etch", "medium")),
-                "final_width": int(body.get("final_width", 460)),
+                "subject_scale": float(body.get("subject_scale", 1.0)),
+                "subject_offset_x": float(body.get("subject_offset_x", 0.0)),
+                "subject_offset_y": float(body.get("subject_offset_y", 0.0)),
+                "card_aspect": str(body.get("card_aspect", "auto")),
+                "quality_tier": str(body.get("quality_tier", "hd")),
+                "final_width": int(body.get("final_width", 480)),
                 "n_frames": int(body.get("n_frames", 48)),
                 "supersample": int(body.get("supersample", 2)),
                 "progress_callback": _progress,

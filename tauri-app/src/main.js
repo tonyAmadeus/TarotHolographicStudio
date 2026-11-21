@@ -35,13 +35,18 @@ const state = {
   metal: "auto",
 
   bg_mode: "auto",
+  card_aspect: "auto",
+  subject_scale: 1.0,
+  subject_offset_x: 0.0,
+  subject_offset_y: 0.0,
   depth_engine: "auto",
   intensity: "medium",
   line_etch: "medium",
   relief_strength: 1.0,
   quicksand_strength: 1.0,
   enable_dof: true,
-  final_width: 460,
+  quality_tier: "hd",
+  final_width: 480,
   n_frames: 48,
   supersample: 2,
 
@@ -66,8 +71,9 @@ function fileBaseName(path) {
   return path.replace(/\\/g, "/").split("/").pop() || path;
 }
 
-function buildLocalFileUrl(filePath) {
-  return `${state.backendUrl}/api/file?path=${encodeURIComponent(filePath)}&t=${Date.now()}`;
+function buildLocalFileUrl(filePath, extraQuery = "") {
+  const suffix = extraQuery ? `&${extraQuery}` : "";
+  return `${state.backendUrl}/api/file?path=${encodeURIComponent(filePath)}${suffix}&t=${Date.now()}`;
 }
 
 function setStatus(text, percent = null) {
@@ -291,8 +297,8 @@ function refreshCurrentView() {
 
   if (state.preview_view === "depth") {
     if (state.depth_path) {
-      showPreviewImage(buildLocalFileUrl(state.depth_path));
-      meta.textContent = `单目深度图（白近黑远）：${state.depth_path}`;
+      showPreviewImage(buildLocalFileUrl(state.depth_path, "as_depth=1"));
+      meta.textContent = `单目深度图（支持 8/16/32 位，白近黑远）：${state.depth_path}`;
     } else {
       showPreviewImage("", "尚未生成或指定深度图，可在左侧点击“一键生成并预览深度图”");
       meta.textContent = "未指定深度图";
@@ -331,6 +337,7 @@ async function requestLive3DPreview() {
       subject_path: state.subject_path || null,
       angle_preset: state.angle_preset,
       preview_width: 360,
+      depth_engine: state.depth_engine,
       bg_path: state.bg_path || null,
       fg_path: state.fg_path || null,
       depth_path: state.depth_path || null,
@@ -343,6 +350,10 @@ async function requestLive3DPreview() {
       metal: state.metal,
       intensity: state.intensity,
       bg_mode: state.bg_mode,
+      card_aspect: state.card_aspect,
+      subject_scale: state.subject_scale,
+      subject_offset_x: state.subject_offset_x,
+      subject_offset_y: state.subject_offset_y,
       line_etch: state.line_etch,
       quicksand_strength: state.quicksand_strength,
       relief_strength: state.relief_strength,
@@ -353,7 +364,10 @@ async function requestLive3DPreview() {
     if (mySeq !== previewSeq) return;
 
     state.last_live3d_data_url = res.image_data_url;
-    state.last_live3d_meta = `卡外:${res.studio_source} | 后景:${res.bg_source} | 前景:${res.fg_source} | 风格:${res.style} / ${res.pattern} / ${res.metal}`;
+    const szTag = Array.isArray(res.subject_size) && res.subject_size[0] > 0 && state.subject_path
+      ? `原图:${res.subject_size[0]}×${res.subject_size[1]} | 缩放:${Math.round(state.subject_scale * 100)}% | `
+      : "";
+    state.last_live3d_meta = `${szTag}卡外:${res.studio_source} | 后景:${res.bg_source} | 前景:${res.fg_source} | 风格:${res.style} / ${res.pattern} / ${res.metal}`;
     if (state.preview_view === "live3d") {
       showPreviewImage(res.image_data_url);
       meta.textContent = state.last_live3d_meta;
@@ -441,10 +455,15 @@ async function handleStartRender() {
       metal: state.metal,
       intensity: state.intensity,
       bg_mode: state.bg_mode,
+      card_aspect: state.card_aspect,
+      subject_scale: state.subject_scale,
+      subject_offset_x: state.subject_offset_x,
+      subject_offset_y: state.subject_offset_y,
       line_etch: state.line_etch,
       quicksand_strength: state.quicksand_strength,
       relief_strength: state.relief_strength,
       enable_dof: state.enable_dof,
+      quality_tier: state.quality_tier,
       final_width: state.final_width,
       n_frames: state.n_frames,
       supersample: state.supersample,
@@ -476,11 +495,13 @@ function startPollingRenderStatus() {
         if (st.error) {
           setRenderButtons(false);
           setStatus(`渲染失败：${st.error}`, 0);
-        } else if (st.result && st.result.output) {
-          state.last_rendered_gif = st.result.output;
+        } else if (st.result && (st.result.output_path || st.result.output)) {
+          const outFile = st.result.output_path || st.result.output;
+          const kbVal = st.result.file_size_kb ?? st.result.size_kb;
+          state.last_rendered_gif = outFile;
           setRenderButtons(false);
-          const kb = st.result.size_kb ? ` (${Number(st.result.size_kb).toFixed(0)} KB)` : "";
-          setStatus(`渲染完成${kb}：${fileBaseName(st.result.output)}`, 100);
+          const kb = kbVal ? ` (${Number(kbVal).toFixed(0)} KB)` : "";
+          setStatus(`渲染完成${kb}：${fileBaseName(outFile)}`, 100);
           setPreviewView("gif", true);
         } else {
           setRenderButtons(false);
@@ -579,24 +600,32 @@ function bindUIEvents() {
   });
 
   // Depth pick / clear / generate
+  const onDepthPathChanged = () => {
+    if (state.preview_view === "depth") {
+      refreshCurrentView();
+    } else {
+      schedulePreview(80);
+    }
+  };
+
   $("#btn-pick-depth").addEventListener("click", async () => {
     const picked = await openFileDialog("选择单目灰度深度图");
     if (picked) {
       state.depth_path = picked;
       $("#input-depth-path").value = picked;
-      schedulePreview(80);
+      onDepthPathChanged();
     }
   });
 
   $("#btn-clear-depth").addEventListener("click", () => {
     state.depth_path = "";
     $("#input-depth-path").value = "";
-    schedulePreview(80);
+    onDepthPathChanged();
   });
 
   $("#input-depth-path").addEventListener("change", (e) => {
     state.depth_path = e.target.value.trim();
-    schedulePreview(80);
+    onDepthPathChanged();
   });
 
   $("#btn-gen-depth").addEventListener("click", handleGenerateDepth);
@@ -658,12 +687,101 @@ function bindUIEvents() {
     schedulePreview(80);
   });
 
-  $("#select-depth-engine").addEventListener("change", (e) => {
-    state.depth_engine = e.target.value;
+  const syncTransformUI = () => {
+    $("#range-subject-scale").value = String(state.subject_scale);
+    $("#out-subject-scale").textContent = `${Math.round(state.subject_scale * 100)}%`;
+    $("#range-offset-x").value = String(state.subject_offset_x);
+    $("#out-offset-x").textContent = `${Math.round(state.subject_offset_x * 100)}%`;
+    $("#range-offset-y").value = String(state.subject_offset_y);
+    $("#out-offset-y").textContent = `${Math.round(state.subject_offset_y * 100)}%`;
+    $("#select-card-aspect").value = state.card_aspect;
+  };
+
+  $("#select-card-aspect").addEventListener("change", (e) => {
+    state.card_aspect = e.target.value;
+    if (state.preview_view !== "live3d") setPreviewView("live3d", false);
+    schedulePreview(80);
   });
 
+  $("#range-subject-scale").addEventListener("input", (e) => {
+    state.subject_scale = parseFloat(e.target.value);
+    $("#out-subject-scale").textContent = `${Math.round(state.subject_scale * 100)}%`;
+    if (state.preview_view !== "live3d") setPreviewView("live3d", false);
+    schedulePreview(130);
+  });
+
+  $("#range-offset-x").addEventListener("input", (e) => {
+    state.subject_offset_x = parseFloat(e.target.value);
+    $("#out-offset-x").textContent = `${Math.round(state.subject_offset_x * 100)}%`;
+    if (state.preview_view !== "live3d") setPreviewView("live3d", false);
+    schedulePreview(130);
+  });
+
+  $("#range-offset-y").addEventListener("input", (e) => {
+    state.subject_offset_y = parseFloat(e.target.value);
+    $("#out-offset-y").textContent = `${Math.round(state.subject_offset_y * 100)}%`;
+    if (state.preview_view !== "live3d") setPreviewView("live3d", false);
+    schedulePreview(130);
+  });
+
+  for (const btn of $$("[data-scale]")) {
+    btn.addEventListener("click", () => {
+      state.subject_scale = parseFloat(btn.dataset.scale);
+      syncTransformUI();
+      if (state.preview_view !== "live3d") setPreviewView("live3d", false);
+      schedulePreview(60);
+    });
+  }
+
+  $("#btn-reset-transform").addEventListener("click", () => {
+    state.subject_scale = 1.0;
+    state.subject_offset_x = 0.0;
+    state.subject_offset_y = 0.0;
+    state.card_aspect = "auto";
+    syncTransformUI();
+    if (state.preview_view !== "live3d") setPreviewView("live3d", false);
+    schedulePreview(60);
+  });
+
+  // Mouse-wheel zoom on live 3D preview stage
+  $("#preview-stage").addEventListener("wheel", (e) => {
+    if (state.preview_view !== "live3d" || !state.subject_path) return;
+    e.preventDefault();
+    const delta = e.deltaY < 0 ? 0.06 : -0.06;
+    state.subject_scale = Math.max(0.4, Math.min(1.8, Math.round((state.subject_scale + delta) * 50) / 50));
+    syncTransformUI();
+    schedulePreview(140);
+  }, { passive: false });
+
+  $("#select-depth-engine").addEventListener("change", (e) => {
+    state.depth_engine = e.target.value;
+    schedulePreview(80);
+  });
+
+  // 3-tier GIF clarity presets
+  const QUALITY_PRESETS = {
+    standard: { width: 360, frames: 36, supersample: 2 },
+    hd: { width: 480, frames: 48, supersample: 2 },
+    ultra: { width: 680, frames: 48, supersample: 2 },
+  };
+  for (const radio of $$('input[name="quality_tier"]')) {
+    radio.addEventListener("change", () => {
+      if (!radio.checked) return;
+      state.quality_tier = radio.value;
+      const preset = QUALITY_PRESETS[radio.value];
+      if (preset) {
+        state.final_width = preset.width;
+        state.n_frames = preset.frames;
+        state.supersample = preset.supersample;
+        $("#input-width").value = String(preset.width);
+        $("#input-frames").value = String(preset.frames);
+        $("#select-supersample").value = String(preset.supersample);
+      }
+    });
+  }
+
   $("#input-width").addEventListener("change", (e) => {
-    state.final_width = Math.max(280, Math.min(900, parseInt(e.target.value, 10) || 460));
+    state.final_width = Math.max(280, Math.min(960, parseInt(e.target.value, 10) || 480));
     e.target.value = String(state.final_width);
   });
 

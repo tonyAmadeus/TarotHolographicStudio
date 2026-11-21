@@ -95,13 +95,57 @@
                 <input id="fallback-file-subject" type="file" accept="image/*" hidden />
               </div>
 
-              <div class="field-row">
-                <label class="field-label" for="select-bg-mode">抠图模式</label>
-                <select id="select-bg-mode" class="select-input">
-                  <option value="auto">自动识别透明/白底</option>
-                  <option value="keep">保留原图全部画面（不抠图）</option>
-                  <option value="remove">强制边缘洪水抠除单色底</option>
-                </select>
+              <div class="field-grid-2">
+                <div class="field-group">
+                  <label class="field-label" for="select-bg-mode">抠图模式</label>
+                  <select id="select-bg-mode" class="select-input">
+                    <option value="auto">自动识别透明/白底</option>
+                    <option value="keep">保留原图全部画面（不抠图）</option>
+                    <option value="remove">强制边缘洪水抠除单色底</option>
+                  </select>
+                </div>
+                <div class="field-group">
+                  <label class="field-label" for="select-card-aspect">卡片画幅比例</label>
+                  <select id="select-card-aspect" class="select-input">
+                    <option value="auto" selected>跟随原图比例</option>
+                    <option value="tarot">标准塔罗牌 (5:8)</option>
+                    <option value="pokemon">宝可梦闪卡 (5:7)</option>
+                    <option value="portrait">经典竖卡 (3:4)</option>
+                    <option value="square">方形流麻砖 (1:1)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="transform-box">
+                <div class="transform-head">
+                  <label class="transform-title" for="range-subject-scale">
+                    主体图片缩放 <output id="out-subject-scale" for="range-subject-scale">100%</output>
+                  </label>
+                  <div class="quick-pills" role="group" aria-label="常用缩放预设">
+                    <button class="pill-btn" data-scale="0.75" type="button">75%</button>
+                    <button class="pill-btn" data-scale="1.0" type="button">100%</button>
+                    <button class="pill-btn" data-scale="1.25" type="button">125%</button>
+                    <button id="btn-reset-transform" class="pill-btn pill-reset" type="button">重置</button>
+                  </div>
+                </div>
+                <input id="range-subject-scale" type="range" min="0.4" max="1.8" step="0.02" value="1.0" />
+
+                <div class="field-grid-2">
+                  <div class="slider-group">
+                    <div class="slider-head">
+                      <label for="range-offset-x">水平偏移 (左右)</label>
+                      <output id="out-offset-x" for="range-offset-x">0%</output>
+                    </div>
+                    <input id="range-offset-x" type="range" min="-0.35" max="0.35" step="0.01" value="0.0" />
+                  </div>
+                  <div class="slider-group">
+                    <div class="slider-head">
+                      <label for="range-offset-y">垂直偏移 (上下)</label>
+                      <output id="out-offset-y" for="range-offset-y">0%</output>
+                    </div>
+                    <input id="range-offset-y" type="range" min="-0.35" max="0.35" step="0.01" value="0.0" />
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -161,8 +205,32 @@
 
             <div class="section-card">
               <div class="section-head">
-                <h2>GIF 导出设置</h2>
-                <span class="hint">48 帧共享 256 色 Median Cut 调色板</span>
+                <h2>GIF 分辨率与导出设置</h2>
+                <span class="hint">3 档清晰度调节 · 共享 256 色调色板</span>
+              </div>
+
+              <div class="quality-grid" role="radiogroup" aria-label="GIF 清晰度档位">
+                <label class="quality-option">
+                  <input type="radio" name="quality_tier" value="standard" />
+                  <span class="quality-card">
+                    <strong>轻量流畅</strong>
+                    <small>360px · 36 帧 · 小体积分享</small>
+                  </span>
+                </label>
+                <label class="quality-option">
+                  <input type="radio" name="quality_tier" value="hd" checked />
+                  <span class="quality-card">
+                    <strong>高清标准</strong>
+                    <small>480px · 48 帧 · 默认推荐</small>
+                  </span>
+                </label>
+                <label class="quality-option">
+                  <input type="radio" name="quality_tier" value="ultra" />
+                  <span class="quality-card">
+                    <strong>超清典藏</strong>
+                    <small>680px · 48 帧 · 锐化高精</small>
+                  </span>
+                </label>
               </div>
 
               <div class="path-picker">
@@ -173,7 +241,7 @@
               <div class="export-metrics">
                 <label class="metric-box">
                   <span>导出宽度 (px)</span>
-                  <input id="input-width" class="num-input" type="number" min="280" max="900" step="20" value="460" />
+                  <input id="input-width" class="num-input" type="number" min="280" max="960" step="20" value="480" />
                 </label>
                 <label class="metric-box">
                   <span>总帧数</span>

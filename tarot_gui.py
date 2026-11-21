@@ -35,10 +35,13 @@ from card_templates import (
     FG_TEMPLATE_META,
     STUDIO_BG_META,
     ensure_default_templates,
+    load_depth_map_f32,
 )
 from depth_estimator import generate_depth_from_image, is_ai_depth_available
 from render_sar_card import render_3layer_sar_gif, render_live_preview_frame
 from render_tarot_holographic import (
+    CARD_ASPECT_META,
+    GIF_QUALITY_PRESETS,
     METAL_META,
     METAL_PALETTES,
     PATTERN_META,
@@ -63,6 +66,8 @@ BG_MODE_OPTIONS: List[Tuple[str, str]] = [
     ("强制抠除纯色底", "remove"),
     ("保留原图背景", "keep"),
 ]
+
+CARD_ASPECT_OPTIONS: List[Tuple[str, str]] = [(lbl, key) for key, lbl in CARD_ASPECT_META]
 
 LINE_ETCH_OPTIONS: List[Tuple[str, str]] = [
     ("中等金属线蚀刻", "medium"),
@@ -259,6 +264,7 @@ class TarotHolographicApp:
         self.output_var = tk.StringVar()
 
         self.bg_mode_var = tk.StringVar(value=BG_MODE_OPTIONS[0][0])
+        self.card_aspect_var = tk.StringVar(value=CARD_ASPECT_OPTIONS[0][0])
         self.line_etch_var = tk.StringVar(value=LINE_ETCH_OPTIONS[0][0])
         self.depth_engine_var = tk.StringVar(value=DEPTH_ENGINE_OPTIONS[0][0])
         self.supersample_var = tk.StringVar(value=SUPERSAMPLE_OPTIONS[0][0])
@@ -272,10 +278,14 @@ class TarotHolographicApp:
         self.pattern_key = "auto"
         self.metal_key = "auto"
 
+        self.subject_scale_var = tk.DoubleVar(value=1.0)
+        self.subject_ox_var = tk.DoubleVar(value=0.0)
+        self.subject_oy_var = tk.DoubleVar(value=0.0)
         self.quicksand_var = tk.DoubleVar(value=1.0)
         self.relief_var = tk.DoubleVar(value=1.0)
         self.dof_var = tk.BooleanVar(value=True)
-        self.width_var = tk.StringVar(value="460")
+        self.quality_tier_key = "hd"
+        self.width_var = tk.StringVar(value="480")
         self.frames_var = tk.StringVar(value="48")
 
         self.status_var = tk.StringVar(value="提示：在「视觉模板库 / 风格与特效」点选任意缩略图即可实时查看右侧 3D 预览")
@@ -579,6 +589,61 @@ class TarotHolographicApp:
         ttk.Combobox(g, textvariable=self.depth_engine_var, values=[x[0] for x in DEPTH_ENGINE_OPTIONS], state="readonly", style="Dark.TCombobox").grid(
             row=1, column=1, columnspan=3, sticky="ew", pady=4
         )
+
+        ttk.Label(g, text="画幅比例").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 6))
+        cb_asp = ttk.Combobox(g, textvariable=self.card_aspect_var, values=[x[0] for x in CARD_ASPECT_OPTIONS], state="readonly", style="Dark.TCombobox")
+        cb_asp.grid(row=2, column=1, sticky="ew", pady=4, padx=(0, 12))
+        cb_asp.bind("<<ComboboxSelected>>", lambda _e: self._schedule_live_preview())
+
+        ttk.Label(g, text="主体缩放").grid(row=2, column=2, sticky="w", pady=4, padx=(0, 6))
+        sc_row = tk.Frame(g, bg=BG_CARD)
+        sc_row.grid(row=2, column=3, sticky="ew", pady=4)
+        tk.Scale(
+            sc_row, from_=0.4, to=1.8, resolution=0.05, orient="horizontal",
+            variable=self.subject_scale_var, showvalue=True, bg=BG_CARD, fg=GOLD_PRIMARY,
+            troughcolor=BG_INPUT, highlightthickness=0, bd=0, length=120,
+            command=lambda _v: self._schedule_live_preview(200),
+        ).pack(side="left", fill="x", expand=True)
+        self._make_button(sc_row, "重置", self._reset_subject_transform, secondary=True, width=4).pack(side="right", padx=(4, 0))
+
+        ttk.Label(g, text="左右偏移").grid(row=3, column=0, sticky="w", pady=2, padx=(0, 6))
+        tk.Scale(
+            g, from_=-0.35, to=0.35, resolution=0.02, orient="horizontal",
+            variable=self.subject_ox_var, showvalue=True, bg=BG_CARD, fg=TEXT_PRIMARY,
+            troughcolor=BG_INPUT, highlightthickness=0, bd=0,
+            command=lambda _v: self._schedule_live_preview(200),
+        ).grid(row=3, column=1, sticky="ew", pady=2, padx=(0, 12))
+
+        ttk.Label(g, text="上下偏移").grid(row=3, column=2, sticky="w", pady=2, padx=(0, 6))
+        tk.Scale(
+            g, from_=-0.35, to=0.35, resolution=0.02, orient="horizontal",
+            variable=self.subject_oy_var, showvalue=True, bg=BG_CARD, fg=TEXT_PRIMARY,
+            troughcolor=BG_INPUT, highlightthickness=0, bd=0,
+            command=lambda _v: self._schedule_live_preview(200),
+        ).grid(row=3, column=3, sticky="ew", pady=2)
+        row += 1
+
+        q_row = tk.Frame(parent, bg=BG_CARD)
+        q_row.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 4))
+        ttk.Label(q_row, text="清晰度档位").pack(side="left", padx=(0, 8))
+        self.quality_btns: Dict[str, tk.Button] = {}
+        for key in ("standard", "hd", "ultra"):
+            p_cfg = GIF_QUALITY_PRESETS[key]
+            b_lbl = f"{p_cfg['label']} ({p_cfg['width']}px)"
+            btn = tk.Button(
+                q_row,
+                text=b_lbl,
+                command=lambda k=key: self._on_pick_quality(k),
+                bg=GOLD_PRIMARY if key == self.quality_tier_key else BG_INPUT,
+                fg="#15120C" if key == self.quality_tier_key else TEXT_PRIMARY,
+                relief="flat",
+                padx=8,
+                pady=3,
+                font=("Microsoft YaHei UI", 8, "bold" if key == self.quality_tier_key else "normal"),
+                cursor="hand2",
+            )
+            btn.pack(side="left", padx=(0, 6))
+            self.quality_btns[key] = btn
         row += 1
 
         exp = tk.Frame(parent, bg=BG_CARD)
@@ -778,6 +843,24 @@ class TarotHolographicApp:
         var.set("")
         self._schedule_live_preview()
 
+    def _reset_subject_transform(self) -> None:
+        self.subject_scale_var.set(1.0)
+        self.subject_ox_var.set(0.0)
+        self.subject_oy_var.set(0.0)
+        self.card_aspect_var.set(CARD_ASPECT_OPTIONS[0][0])
+        self._schedule_live_preview(40)
+
+    def _on_pick_quality(self, key: str) -> None:
+        self.quality_tier_key = key
+        cfg = GIF_QUALITY_PRESETS[key]
+        self.width_var.set(str(cfg["width"]))
+        self.frames_var.set(str(cfg["frames"]))
+        for k, btn in self.quality_btns.items():
+            if k == key:
+                btn.configure(bg=GOLD_PRIMARY, fg="#15120C", font=("Microsoft YaHei UI", 8, "bold"))
+            else:
+                btn.configure(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 8, "normal"))
+
     # ------------------------------------------------------------------
     # File Browsers
     # ------------------------------------------------------------------
@@ -892,7 +975,12 @@ class TarotHolographicApp:
             "pattern": self.pattern_key,
             "metal": self.metal_key,
             "intensity": self.intensity_key,
+            "depth_engine": str(self._lookup(DEPTH_ENGINE_OPTIONS, self.depth_engine_var.get())),
             "bg_mode": str(self._lookup(BG_MODE_OPTIONS, self.bg_mode_var.get())),
+            "card_aspect": str(self._lookup(CARD_ASPECT_OPTIONS, self.card_aspect_var.get())),
+            "subject_scale": float(self.subject_scale_var.get()),
+            "subject_offset_x": float(self.subject_ox_var.get()),
+            "subject_offset_y": float(self.subject_oy_var.get()),
             "line_etch": str(self._lookup(LINE_ETCH_OPTIONS, self.line_etch_var.get())),
             "quicksand_strength": float(self.quicksand_var.get()),
             "relief_strength": float(self.relief_var.get()),
@@ -982,14 +1070,17 @@ class TarotHolographicApp:
     def _load_depth_preview(self, path: str) -> None:
         self._stop_gif_animation()
         try:
-            im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
-            orig_w, orig_h = im.size
+            d_f32, bit_desc = load_depth_map_f32(path)
+            orig_h, orig_w = d_f32.shape[:2]
+            d_max = float(d_f32.max())
+            d_u8 = np.clip((d_f32 / max(1e-5, d_max)) * 255.0 + 0.5, 0, 255).astype(np.uint8) if d_max > 1e-5 else np.zeros((orig_h, orig_w), dtype=np.uint8)
+            im = Image.fromarray(d_u8, mode="L").convert("RGB")
             max_w, max_h = self._get_preview_bounds()
             im.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
             self.depth_photo = ImageTk.PhotoImage(im)
             self.btn_view_depth.configure(state="normal")
             self._switch_view("depth")
-            self.preview_info_var.set(f"单目深度图：{os.path.basename(path)} ({orig_w}×{orig_h}，白近黑远)")
+            self.preview_info_var.set(f"单目深度图：{os.path.basename(path)} ({orig_w}×{orig_h} · {bit_desc}，白近黑远)")
         except Exception as exc:
             messagebox.showerror("无法读取深度图", str(exc))
 
@@ -1100,7 +1191,12 @@ class TarotHolographicApp:
             "metal": self.metal_key,
             "intensity": self.intensity_key,
             "bg_mode": str(self._lookup(BG_MODE_OPTIONS, self.bg_mode_var.get())),
+            "card_aspect": str(self._lookup(CARD_ASPECT_OPTIONS, self.card_aspect_var.get())),
+            "subject_scale": float(self.subject_scale_var.get()),
+            "subject_offset_x": float(self.subject_ox_var.get()),
+            "subject_offset_y": float(self.subject_oy_var.get()),
             "line_etch": str(self._lookup(LINE_ETCH_OPTIONS, self.line_etch_var.get())),
+            "quality_tier": self.quality_tier_key,
             "final_width": final_width,
             "n_frames": n_frames,
             "supersample": int(self._lookup(SUPERSAMPLE_OPTIONS, self.supersample_var.get())),

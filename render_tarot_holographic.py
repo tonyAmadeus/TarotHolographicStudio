@@ -33,7 +33,7 @@ import threading
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +174,141 @@ LINE_ETCH_SCALES = {
     "medium": 1.00,
     "strong": 1.45,
 }
+
+CARD_ASPECT_RATIOS: Dict[str, Optional[float]] = {
+    "auto": None,
+    "tarot": 1.62,
+    "pokemon": 1.40,
+    "portrait": 4.0 / 3.0,
+    "square": 1.0,
+}
+
+CARD_ASPECT_META: List[Tuple[str, str]] = [
+    ("auto", "跟随原图比例"),
+    ("tarot", "标准塔罗牌 (5:8)"),
+    ("pokemon", "宝可梦闪卡 (5:7)"),
+    ("portrait", "经典竖卡 (3:4)"),
+    ("square", "方形流麻砖 (1:1)"),
+]
+
+GIF_QUALITY_PRESETS: Dict[str, Dict[str, object]] = {
+    "standard": {
+        "label": "轻量流畅",
+        "desc": "360px · 36帧 · 小体积快传",
+        "width": 360,
+        "frames": 36,
+        "supersample": 2,
+        "palette_sample": 110,
+        "sharpen_pct": 0,
+    },
+    "hd": {
+        "label": "高清标准",
+        "desc": "480px · 48帧 · 均衡推荐",
+        "width": 480,
+        "frames": 48,
+        "supersample": 2,
+        "palette_sample": 144,
+        "sharpen_pct": 26,
+    },
+    "ultra": {
+        "label": "超清典藏",
+        "desc": "680px · 48帧 · 高精锐化",
+        "width": 680,
+        "frames": 48,
+        "supersample": 2,
+        "palette_sample": 200,
+        "sharpen_pct": 42,
+    },
+}
+
+
+def resolve_inner_aspect(src_h: int, src_w: int, card_aspect: str = "auto") -> float:
+    """Resolve card inner height/width ratio from preset or source image dimensions."""
+    ratio = CARD_ASPECT_RATIOS.get(card_aspect)
+    if ratio is not None:
+        return float(ratio)
+    return float(src_h) / max(1.0, float(src_w))
+
+
+def place_subject_on_canvas(
+    src_rgb: np.ndarray,
+    src_alpha: np.ndarray,
+    canvas_w: int,
+    canvas_h: int,
+    fit_w: Optional[int] = None,
+    fit_h: Optional[int] = None,
+    subject_scale: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    depth_raw: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Place subject RGB, alpha, and optional 1:1 aligned depth map onto a target
+    (canvas_h, canvas_w) surface with premultiplied-alpha anti-aliasing (zero
+    dark edge fringe), proportional contain-fit inside (fit_w, fit_h), user zoom
+    (`subject_scale`), and center offset (`offset_x`, `offset_y` in fractions of
+    canvas dimensions).
+    """
+    src_h, src_w = src_rgb.shape[:2]
+    fw = float(fit_w if fit_w is not None else canvas_w)
+    fh = float(fit_h if fit_h is not None else canvas_h)
+    base_fit = min(fw / max(1.0, float(src_w)), fh / max(1.0, float(src_h)))
+    scale = max(0.15, min(3.0, float(subject_scale))) * base_fit
+
+    cx_s = (src_w - 1.0) * 0.5
+    cy_s = (src_h - 1.0) * 0.5
+    cx_t = (canvas_w - 1.0) * 0.5 + float(offset_x) * float(canvas_w)
+    cy_t = (canvas_h - 1.0) * 0.5 + float(offset_y) * float(canvas_h)
+
+    M = np.array(
+        [
+            [scale, 0.0, cx_t - scale * cx_s],
+            [0.0, scale, cy_t - scale * cy_s],
+        ],
+        dtype=np.float32,
+    )
+
+    interp = cv2.INTER_AREA if scale < 0.99 else cv2.INTER_LINEAR
+    premul = (src_rgb * src_alpha[..., None]).astype(np.float32)
+    out_premul = cv2.warpAffine(
+        premul,
+        M,
+        (canvas_w, canvas_h),
+        flags=interp,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0.0, 0.0, 0.0),
+    )
+    out_a = cv2.warpAffine(
+        src_alpha.astype(np.float32),
+        M,
+        (canvas_w, canvas_h),
+        flags=interp,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    out_a = np.clip(out_a, 0.0, 1.0).astype(np.float32)
+    out_rgb = np.where(
+        out_a[..., None] > 1e-4,
+        np.clip(out_premul / np.maximum(out_a[..., None], 1e-4), 0.0, 1.0),
+        0.0,
+    ).astype(np.float32)
+
+    out_depth: Optional[np.ndarray] = None
+    if depth_raw is not None:
+        d_src = depth_raw.astype(np.float32)
+        if d_src.shape[:2] != (src_h, src_w):
+            d_src = cv2.resize(d_src, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
+        out_depth = cv2.warpAffine(
+            d_src,
+            M,
+            (canvas_w, canvas_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        out_depth = np.clip(out_depth, 0.0, 1.0).astype(np.float32)
+
+    return out_rgb, out_a, out_depth
 
 
 def analyze_image_theme(
@@ -497,41 +632,53 @@ def build_card_base_and_frame(
     theme: ThemeConfig,
     subject_alpha: Optional[np.ndarray] = None,
     bg_removed: bool = False,
+    subject_scale: float = 1.0,
+    subject_offset_x: float = 0.0,
+    subject_offset_y: float = 0.0,
+    card_aspect: str = "auto",
 ) -> Dict[str, np.ndarray]:
     """
-    Prepare the card face texture at working resolution while preserving 100% of
-    the original image's aspect ratio and content. If bg_removed is True,
-    composites the cleanly extracted subject into a unified dark etched tarot
-    backdrop; otherwise preserves original pixels inside a safe metallic border.
+    Prepare the card face texture at working resolution while preserving the
+    subject's proportions and applying optional user scaling/offset & card aspect.
     """
     src_h, src_w = src_rgb.shape[:2]
-    has_border = False if bg_removed else detect_existing_border(src_rgb)
+    has_user_xform = (
+        abs(subject_scale - 1.0) > 1e-3
+        or abs(subject_offset_x) > 1e-3
+        or abs(subject_offset_y) > 1e-3
+        or card_aspect != "auto"
+    )
+    has_border = False if (bg_removed or has_user_xform) else detect_existing_border(src_rgb)
+    aspect_hw = resolve_inner_aspect(src_h, src_w, card_aspect=card_aspect)
 
     if has_border:
         pad = 0
         inner_w = target_card_w
-        inner_h = int(round(inner_w * (src_h / src_w)))
+        inner_h = int(round(inner_w * aspect_hw))
         card_w, card_h = inner_w, inner_h
     else:
         pad = max(20, int(round(target_card_w * 0.052)))
         inner_w = target_card_w - 2 * pad
-        inner_h = int(round(inner_w * (src_h / src_w)))
+        inner_h = int(round(inner_w * aspect_hw))
         card_w = inner_w + 2 * pad
         card_h = inner_h + 2 * pad
 
-    # High-quality resize of original image (exact aspect ratio preserved)
-    src_u8 = np.clip(src_rgb * 255.0, 0, 255).astype(np.uint8)
-    inner_u8 = cv2.resize(src_u8, (inner_w, inner_h), interpolation=cv2.INTER_AREA)
-    inner_rgb = inner_u8.astype(np.float32) / 255.0
+    src_a_in = subject_alpha if (bg_removed and subject_alpha is not None) else np.ones((src_h, src_w), dtype=np.float32)
+    inner_rgb, inner_a, _ = place_subject_on_canvas(
+        src_rgb,
+        src_a_in,
+        canvas_w=inner_w,
+        canvas_h=inner_h,
+        fit_w=inner_w,
+        fit_h=inner_h,
+        subject_scale=subject_scale,
+        offset_x=subject_offset_x,
+        offset_y=subject_offset_y,
+    )
 
-    # Resize subject alpha if background was knocked out
     subject_alpha_full = np.zeros((card_h, card_w), dtype=np.float32)
-    if bg_removed and subject_alpha is not None:
-        inner_a = cv2.resize(subject_alpha, (inner_w, inner_h), interpolation=cv2.INTER_AREA)
-        inner_a = np.clip(inner_a, 0.0, 1.0).astype(np.float32)
-        subject_alpha_full[pad:pad + inner_h, pad:pad + inner_w] = inner_a
-    else:
-        subject_alpha_full[pad:pad + inner_h, pad:pad + inner_w] = 1.0
+    subject_alpha_full[pad:pad + inner_h, pad:pad + inner_w] = inner_a
+    effective_bg_removed = bg_removed or bool(np.any(inner_a < 0.95))
 
     # Anti-aliased rounded corner mask (only cuts outer border when pad > 0)
     radius = float(max(14, int(round(pad * 1.15)))) if pad > 0 else float(max(12, int(round(min(card_w, card_h) * 0.028))))
@@ -549,8 +696,8 @@ def build_card_base_and_frame(
     ornament_mask = np.zeros((card_h, card_w), dtype=np.float32)
     celestial_orn = np.zeros((card_h, card_w), dtype=np.float32)
 
-    if bg_removed:
-        # Unified dark etched tarot canvas behind the cutout subject
+    if effective_bg_removed:
+        # Unified dark etched tarot canvas behind the cutout/resized subject
         card_rgb, celestial_orn = build_tarot_etched_backdrop(card_h, card_w, theme)
     elif pad > 0:
         border_stock = np.clip(theme.bg_center * 0.85 + 0.025, 0.04, 0.14)
@@ -620,6 +767,7 @@ def build_card_base_and_frame(
     inner_line = np.clip((blackhat - 0.14) / 0.55, 0.0, 1.0) ** 0.85
 
     # Soften line glare on upper face/skin so eyes & expression remain crisp and gentle
+    inner_u8 = np.clip(inner_rgb * 255.0, 0, 255).astype(np.uint8)
     inner_ycrcb = cv2.cvtColor(inner_u8, cv2.COLOR_RGB2YCrCb).astype(np.float32)
     inner_skin = (
         np.exp(-0.5 * ((inner_ycrcb[..., 1] - 146.0) / 14.0) ** 2)
@@ -636,9 +784,9 @@ def build_card_base_and_frame(
     line_gx = cv2.Sobel(line_etch_mask, cv2.CV_32F, 1, 0, ksize=3)
     line_gy = cv2.Sobel(line_etch_mask, cv2.CV_32F, 0, 1, ksize=3)
 
-    # Composite cutout subject cleanly ON TOP of the etched backdrop + subtle grounding shadow
+    # Composite cutout/resized subject cleanly ON TOP of the etched backdrop + subtle grounding shadow
     bg_cutout_mask = np.zeros((card_h, card_w), dtype=np.float32)
-    if bg_removed:
+    if effective_bg_removed:
         # Soft ambient grounding shadow cast by subject onto the etched tarot background
         shadow_blur = cv2.GaussianBlur(subject_alpha_full, (0, 0), sigmaX=max(5.0, card_w * 0.012))
         shadow_shift = np.roll(np.roll(shadow_blur, max(2, card_h // 180), axis=0), max(2, card_w // 180), axis=1)
@@ -1216,7 +1364,7 @@ def shade_card_face(
     # 3. Seamless periodic glass sweep band & moving local spotlight
     diag_coord = u_norm * 0.70 + v_norm * 0.30
     sweep_center = 0.50 + 0.64 * math.sin(theta - 0.35)
-    sweep_band = np.exp(-0.5 * ((diag_coord - sweep_center) / 0.125) ** 2).astype(np.float32)
+    sweep_band = np.exp(-0.5 * ((diag_coord - sweep_center) / 0.078) ** 2).astype(np.float32)
 
     # Broad soft moving spotlight linked to tilt
     spot_x = 0.50 + 0.30 * math.sin(theta + 0.15)
@@ -1224,24 +1372,25 @@ def shade_card_face(
     spot = np.exp(-0.5 * (((u_norm - spot_x) / 0.36) ** 2 + ((v_norm - spot_y) / 0.38) ** 2)).astype(np.float32)
 
     # Etched metallic grooves ignite when sweep or spotlight passes over them
-    etch_zone = np.clip(outer_frame * 0.95 + dark_bg * 0.90 + non_protect * 0.52, 0.0, 1.0) * (1.0 - protect * 0.86)
-    etch_glint = etch_tex * etch_zone * (0.24 + 0.76 * np.clip(sweep_band * 1.25 + spot * 0.55, 0.0, 1.0)) * inten
+    etch_zone = np.clip(outer_frame * 0.95 + dark_bg * 0.90 + non_protect * 0.48, 0.0, 1.0) * (1.0 - protect * 0.88)
+    etch_glint = etch_tex * etch_zone * (0.20 + 0.80 * np.clip(sweep_band * 1.25 + spot * 0.45, 0.0, 1.0)) * inten
     etch_color = irid_mix * 0.55 + theme.metal_bright[None, None, :] * 0.45
-    out = out + etch_color * (etch_glint * 0.36)[..., None] * (1.0 - out * 0.28)
+    out = out + etch_color * (etch_glint * 0.34)[..., None] * (1.0 - out * 0.28)
 
-    # Sweep boosts strongly on gilded frame/ornaments, attenuates cleanly on protected face & text
+    # Sweep boosts strongly on gilded frame/ornaments, stays crisp & clean on protected subject/face
     sweep_mask = (
-        0.10 * (1.0 - protect * 0.72)
-        + accent * 0.36
-        + ornament * 0.52
-        + dark_bg * 0.14
+        0.045 * (1.0 - protect * 0.82)
+        + accent * 0.34
+        + ornament * 0.50
+        + dark_bg * 0.12
     ) * inten
     sweep_color = theme.metal_bright * 0.65 + np.array([1.0, 1.0, 1.0], dtype=np.float32) * 0.35
-    out = out + sweep_color[None, None, :] * (sweep_band * sweep_mask * 0.52)[..., None]
+    out = out + sweep_color[None, None, :] * (sweep_band * sweep_mask * 0.46)[..., None]
 
-    # Subtle laminated gloss from spotlight
-    spot_strength = (0.055 * (1.0 - protect * 0.65) + accent * 0.10) * inten
-    out = out + (theme.metal_bright * 0.45 + 0.55)[None, None, :] * (spot * spot_strength)[..., None]
+    # Multiplicative studio spotlight (keeps deep blacks rich, never adds milky haze over subject!)
+    out = out * (0.96 + 0.06 * spot[..., None])
+    spot_accent = (accent * 0.08 + dark_bg * 0.025) * inten
+    out = out + (theme.metal_bright * 0.50 + 0.50)[None, None, :] * (spot * spot_accent)[..., None]
 
     # 4. Localized hot-stamping gold reflection & Sobel micro-emboss
     lx = float(local_light[0])
@@ -1544,28 +1693,55 @@ def export_shared_palette_gif(
     frames_rgb_u8: List[np.ndarray],
     output_path: str,
     durations: List[int],
+    quality_tier: str = "hd",
 ) -> None:
     """
-    Build one shared 256-color adaptive Median-Cut palette sampled uniformly
-    across all frames, then quantize every frame to that shared palette with
-    Floyd-Steinberg dithering to prevent palette flicker.
+    Build one subject-prioritized shared 256-color adaptive palette sampled across
+    all frames, then quantize every frame cleanly with Floyd-Steinberg dithering:
+      - Includes BOTH full-frame thumbnails (smooth studio backdrop gradients) AND
+        2x-weighted central card-subject crops so the 256-color palette dedicates
+        rich exact colors to skin tones, dark hair, shadows, and vivid clothing
+        instead of starving the subject and causing grey dithering washout!
     """
-    # Sample uniform horizontal strips/thumbnails from all frames to build a representative mosaic
-    sample_w, sample_h = 120, 150
-    cols = 8
-    rows = math.ceil(len(frames_rgb_u8) / cols)
-    mosaic = Image.new("RGB", (cols * sample_w, rows * sample_h))
+    preset = GIF_QUALITY_PRESETS.get(quality_tier, GIF_QUALITY_PRESETS["hd"])
+    sample_w = int(preset["palette_sample"])
+    sharpen_pct = int(preset["sharpen_pct"])
+    fh, fw = frames_rgb_u8[0].shape[:2]
+    sample_h = max(80, int(round(sample_w * (fh / max(1.0, float(fw))))))
 
+    n = len(frames_rgb_u8)
+    # Build subject-prioritized mosaic: 1x full frame + 2x central card crop per sampled frame
+    stride = 1 if n <= 24 else 2
+    sampled_idx = list(range(0, n, stride))
+    tiles: List[Image.Image] = []
     pil_frames: List[Image.Image] = []
+
+    cx0, cx1 = int(fw * 0.14), int(fw * 0.86)
+    cy0, cy1 = int(fh * 0.10), int(fh * 0.90)
+
     for idx, arr in enumerate(frames_rgb_u8):
         im = Image.fromarray(arr, mode="RGB")
+        if sharpen_pct > 0:
+            im = im.filter(ImageFilter.UnsharpMask(radius=0.9, percent=sharpen_pct, threshold=3))
         pil_frames.append(im)
-        thumb = im.resize((sample_w, sample_h), Image.Resampling.BILINEAR)
-        r_idx, c_idx = divmod(idx, cols)
-        mosaic.paste(thumb, (c_idx * sample_w, r_idx * sample_h))
+        if idx in sampled_idx:
+            tiles.append(im.resize((sample_w, sample_h), Image.Resampling.BILINEAR))
+            card_crop = im.crop((cx0, cy0, cx1, cy1)).resize((sample_w, sample_h), Image.Resampling.BILINEAR)
+            tiles.append(card_crop)
+            tiles.append(card_crop)
 
-    # Median-Cut shared 256-color palette
-    palette_img = mosaic.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    cols = 8
+    rows = math.ceil(len(tiles) / cols)
+    mosaic = Image.new("RGB", (cols * sample_w, rows * sample_h))
+    for i_t, tile in enumerate(tiles):
+        r_idx, c_idx = divmod(i_t, cols)
+        mosaic.paste(tile, (c_idx * sample_w, r_idx * sample_h))
+
+    # Build rich shared 256-color palette (FASTOCTREE preserves darks & vivid saturated colors better than MEDIANCUT)
+    try:
+        palette_img = mosaic.quantize(colors=256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
+    except Exception:
+        palette_img = mosaic.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
 
     quantized_frames = [
         im.quantize(palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG)
@@ -1601,7 +1777,12 @@ def render_tarot_gif(
     line_etch: str = "medium",
     studio_bg: str = "auto",
     studio_bg_path: Optional[str] = None,
-    final_width: int = 460,
+    subject_scale: float = 1.0,
+    subject_offset_x: float = 0.0,
+    subject_offset_y: float = 0.0,
+    card_aspect: str = "auto",
+    quality_tier: str = "hd",
+    final_width: int = 480,
     n_frames: int = 48,
     supersample: int = 2,
     thickness_layers: int = 8,
@@ -1632,7 +1813,9 @@ def render_tarot_gif(
     # Initial card working width (~70% of supersampled canvas width)
     init_card_w = int(round(ss_canvas_w * 0.70))
     card_data = build_card_base_and_frame(
-        src_rgb, init_card_w, theme, subject_alpha=subject_alpha, bg_removed=bg_removed
+        src_rgb, init_card_w, theme, subject_alpha=subject_alpha, bg_removed=bg_removed,
+        subject_scale=subject_scale, subject_offset_x=subject_offset_x,
+        subject_offset_y=subject_offset_y, card_aspect=card_aspect,
     )
     card_h, card_w = card_data["card_rgb"].shape[:2]
 
@@ -1649,7 +1832,9 @@ def render_tarot_gif(
     if abs(scale_adj - 1.0) > 0.03:
         opt_card_w = int(round(init_card_w * scale_adj))
         card_data = build_card_base_and_frame(
-            src_rgb, opt_card_w, theme, subject_alpha=subject_alpha, bg_removed=bg_removed
+            src_rgb, opt_card_w, theme, subject_alpha=subject_alpha, bg_removed=bg_removed,
+            subject_scale=subject_scale, subject_offset_x=subject_offset_x,
+            subject_offset_y=subject_offset_y, card_aspect=card_aspect,
         )
         card_h, card_w = card_data["card_rgb"].shape[:2]
         focal = float(card_h * 2.65)
@@ -1805,7 +1990,7 @@ def render_tarot_gif(
 
     _report(n_frames + 1, total_steps, "正在构建共享 256 色调色板并导出 GIF...")
     durations = build_even_durations(n_frames=n_frames, n_50ms=26)
-    export_shared_palette_gif(frames_final, output_path, durations)
+    export_shared_palette_gif(frames_final, output_path, durations, quality_tier=quality_tier)
     _report(total_steps, total_steps, "渲染完成！")
 
     total_ms = sum(durations)
