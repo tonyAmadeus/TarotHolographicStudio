@@ -144,6 +144,63 @@ def _guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: int, eps: fl
     return (mean_a * guide + mean_b).astype(np.float32)
 
 
+def _guided_filter_color(
+    guide_rgb: np.ndarray,
+    src: np.ndarray,
+    radius: int,
+    eps: float = 0.0022,
+) -> np.ndarray:
+    """
+    Fast O(N) 3-channel CIE Lab Color Guided Image Filter (He & Sun):
+    locks depth edges onto BOTH luminance and isoluminant hue/chroma boundaries
+    (e.g. pink sleeve over light-blue wing, peach skin next to white hair).
+    """
+    lab = cv2.cvtColor(np.clip(guide_rgb, 0.0, 1.0).astype(np.float32), cv2.COLOR_RGB2LAB)
+    I0 = (lab[..., 0] * np.float32(0.01)).astype(np.float32)
+    I1 = ((lab[..., 1] + np.float32(128.0)) * np.float32(0.00333)).astype(np.float32)
+    I2 = ((lab[..., 2] + np.float32(128.0)) * np.float32(0.00333)).astype(np.float32)
+    p = src.astype(np.float32)
+
+    k = (2 * radius + 1, 2 * radius + 1)
+    m0 = cv2.boxFilter(I0, cv2.CV_32F, k)
+    m1 = cv2.boxFilter(I1, cv2.CV_32F, k)
+    m2 = cv2.boxFilter(I2, cv2.CV_32F, k)
+    mp = cv2.boxFilter(p, cv2.CV_32F, k)
+
+    e = np.float32(eps)
+    v00 = cv2.boxFilter(I0 * I0, cv2.CV_32F, k) - m0 * m0 + e
+    v01 = cv2.boxFilter(I0 * I1, cv2.CV_32F, k) - m0 * m1
+    v02 = cv2.boxFilter(I0 * I2, cv2.CV_32F, k) - m0 * m2
+    v11 = cv2.boxFilter(I1 * I1, cv2.CV_32F, k) - m1 * m1 + e
+    v12 = cv2.boxFilter(I1 * I2, cv2.CV_32F, k) - m1 * m2
+    v22 = cv2.boxFilter(I2 * I2, cv2.CV_32F, k) - m2 * m2 + e
+
+    c0 = cv2.boxFilter(I0 * p, cv2.CV_32F, k) - m0 * mp
+    c1 = cv2.boxFilter(I1 * p, cv2.CV_32F, k) - m1 * mp
+    c2 = cv2.boxFilter(I2 * p, cv2.CV_32F, k) - m2 * mp
+
+    cof00 = v11 * v22 - v12 * v12
+    cof01 = v02 * v12 - v01 * v22
+    cof02 = v01 * v12 - v02 * v11
+    cof11 = v00 * v22 - v02 * v02
+    cof12 = v01 * v02 - v00 * v12
+    cof22 = v00 * v11 - v01 * v01
+
+    det = np.maximum(v00 * cof00 + v01 * cof01 + v02 * cof02, np.float32(1e-10))
+    inv_det = np.float32(1.0) / det
+
+    a0 = (cof00 * c0 + cof01 * c1 + cof02 * c2) * inv_det
+    a1 = (cof01 * c0 + cof11 * c1 + cof12 * c2) * inv_det
+    a2 = (cof02 * c0 + cof12 * c1 + cof22 * c2) * inv_det
+    b = mp - a0 * m0 - a1 * m1 - a2 * m2
+
+    ma0 = cv2.boxFilter(a0, cv2.CV_32F, k)
+    ma1 = cv2.boxFilter(a1, cv2.CV_32F, k)
+    ma2 = cv2.boxFilter(a2, cv2.CV_32F, k)
+    mb = cv2.boxFilter(b, cv2.CV_32F, k)
+    return (ma0 * I0 + ma1 * I1 + ma2 * I2 + mb).astype(np.float32)
+
+
 def estimate_depth_fast(
     subject_rgb: np.ndarray,
     subject_alpha: np.ndarray,
@@ -253,22 +310,36 @@ _AI_DEPTH_CACHE: dict = {}
 
 
 def _postprocess_ai_depth(raw_depth: np.ndarray, subject_alpha: np.ndarray) -> np.ndarray:
-    """Normalize predicted AI depth cleanly inside subject silhouette & set background black."""
+    """
+    Losslessly normalize raw float32 AI depth inside subject silhouette without
+    cross-zero bilateral edge bleeding (keeps outer silhouette rim crisp!).
+    """
     h, w = subject_alpha.shape[:2]
-    fg = subject_alpha > 0.25
-    if np.any(fg):
-        fg_vals = raw_depth[fg]
-        lo, hi = float(np.percentile(fg_vals, 2)), float(np.percentile(fg_vals, 98))
+    valid_fg = subject_alpha > 0.04
+    fg_stats = subject_alpha > 0.15
+    if np.any(fg_stats):
+        fg_vals = raw_depth[fg_stats]
+        lo, hi = float(np.percentile(fg_vals, 1.5)), float(np.percentile(fg_vals, 98.5))
         norm = np.clip((raw_depth - lo) / max(1e-5, hi - lo), 0.0, 1.0)
-        norm = 0.14 + 0.84 * norm
-        depth = np.where(subject_alpha > 0.15, norm, 0.0).astype(np.float32)
+        norm = (0.06 + 0.94 * norm).astype(np.float32)
     else:
         lo, hi = float(raw_depth.min()), float(raw_depth.max())
-        depth = np.clip((raw_depth - lo) / max(1e-5, hi - lo), 0.0, 1.0).astype(np.float32)
+        norm = np.clip((raw_depth - lo) / max(1e-5, hi - lo), 0.0, 1.0).astype(np.float32)
 
-    depth = cv2.bilateralFilter(depth, d=9, sigmaColor=0.18, sigmaSpace=max(5.0, w * 0.012))
-    depth = np.where(subject_alpha > 0.12, depth, 0.0).astype(np.float32)
-    return np.clip(depth, 0.0, 1.0).astype(np.float32)
+    # Extrapolate valid interior depth outward BEFORE light bilateral smoothing so
+    # transparent background 0.0 NEVER bleeds inward across silhouette contours!
+    if np.any(fg_stats) and not np.all(valid_fg):
+        inv = (~fg_stats).astype(np.uint8)
+        _, labels = cv2.distanceTransformWithLabels(inv, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+        coords = np.argwhere(fg_stats)
+        idx = np.clip(labels - 1, 0, len(coords) - 1)
+        d_ext = np.where(fg_stats, norm, norm[coords[idx, 0], coords[idx, 1]]).astype(np.float32)
+    else:
+        d_ext = norm
+
+    d_clean = cv2.bilateralFilter(d_ext, d=5, sigmaColor=0.06, sigmaSpace=max(3.0, w * 0.006))
+    depth = np.where(valid_fg, np.clip(d_clean, 0.06, 1.0), 0.0).astype(np.float32)
+    return depth
 
 
 def estimate_depth_onnx(
@@ -460,8 +531,13 @@ def generate_depth_from_image(
         used_engine = "fast"
 
     if output_path:
-        out_u8 = np.clip(depth * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        Image.fromarray(out_u8, mode="L").save(output_path)
+        # Save lossless 16-bit grayscale PNG (0..65535) to preserve full AI float32 precision
+        out_u16 = np.clip(depth * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
+        ok, enc = cv2.imencode(".png", out_u16)
+        if ok:
+            enc.tofile(output_path)
+        else:
+            Image.fromarray(out_u16, mode="I;16").save(output_path)
 
     return depth, used_engine
 

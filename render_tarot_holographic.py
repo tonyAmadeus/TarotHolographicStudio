@@ -33,7 +33,7 @@ import threading
 
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 
 # ---------------------------------------------------------------------------
@@ -298,15 +298,20 @@ def place_subject_on_canvas(
         d_src = depth_raw.astype(np.float32)
         if d_src.shape[:2] != (src_h, src_w):
             d_src = cv2.resize(d_src, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
-        out_depth = cv2.warpAffine(
-            d_src,
+        d_premul = (d_src * src_alpha.astype(np.float32)).astype(np.float32)
+        out_d_pre = cv2.warpAffine(
+            d_premul,
             M,
             (canvas_w, canvas_h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0.0,
         )
-        out_depth = np.clip(out_depth, 0.0, 1.0).astype(np.float32)
+        out_depth = np.where(
+            out_a > 1e-4,
+            np.clip(out_d_pre / np.maximum(out_a, 1e-4), 0.0, 1.0),
+            0.0,
+        ).astype(np.float32)
 
     return out_rgb, out_a, out_depth
 
@@ -1264,6 +1269,97 @@ def spectral_iridescence(phase: np.ndarray) -> np.ndarray:
     return np.stack([r, g, b], axis=-1).astype(np.float32)
 
 
+def apply_highlight_rolloff(
+    img: np.ndarray,
+    knee: float = 0.92,
+    spread: float = 0.08,
+) -> np.ndarray:
+    """
+    C^1-continuous soft-knee highlight compression: preserves pure cel midtones
+    below `knee` untouched while smoothly rolling bright specular peaks into [knee, 1].
+    """
+    over = np.maximum(img - knee, 0.0)
+    rolled = knee + (1.0 - knee) * np.tanh(over / max(1e-4, spread))
+    return np.clip(np.where(img > knee, rolled, img), 0.0, 1.0).astype(np.float32)
+
+
+def premul_to_pil_rgba(premul_f32: np.ndarray, alpha_f32: np.ndarray) -> Image.Image:
+    """Un-premultiply Premultiplied RGB + Alpha cleanly into a Pillow RGBA Image (zero dark fringe)."""
+    a = np.clip(alpha_f32, 0.0, 1.0)
+    a3 = a[..., None]
+    rgb = np.where(a3 > 1e-4, np.clip(premul_f32 / np.maximum(a3, 1e-4), 0.0, 1.0), 0.0)
+    h, w = a.shape[:2]
+    rgba_u8 = np.empty((h, w, 4), dtype=np.uint8)
+    rgba_u8[..., :3] = np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    rgba_u8[..., 3] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgba_u8, mode="RGBA")
+
+
+def warp_premultiplied_to_pil_rgba(
+    rgb_f32: np.ndarray,
+    alpha_f32: np.ndarray,
+    H: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> Image.Image:
+    """Premultiplied-Alpha OpenCV perspective warp returned as a clean Pillow RGBA Image."""
+    premul = (rgb_f32 * alpha_f32[..., None]).astype(np.float32)
+    w_premul = cv2.warpPerspective(
+        premul,
+        H,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0.0, 0.0, 0.0),
+    )
+    w_alpha = cv2.warpPerspective(
+        alpha_f32.astype(np.float32),
+        H,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    return premul_to_pil_rgba(w_premul, w_alpha)
+
+
+def compose_studio_frame_pillow(
+    studio_rgb: np.ndarray,
+    shadow_alpha: np.ndarray,
+    edge_premul: np.ndarray,
+    edge_alpha: np.ndarray,
+    face_pil_rgba: Image.Image,
+    fx_add_rgb: np.ndarray,
+    final_width: int,
+    final_h: int,
+) -> Image.Image:
+    """
+    Pillow-based RGBA layer compositing (studio -> drop shadow -> brushed metallic
+    edge stack -> front 3D card face -> additive star glints/particles) + Lanczos downsample.
+    """
+    h, w = studio_rgb.shape[:2]
+    studio_u8 = np.clip(studio_rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    pil_comp = Image.fromarray(studio_u8, mode="RGB").convert("RGBA")
+
+    sh_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    sh_rgba[..., 3] = np.clip(shadow_alpha * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    pil_comp = Image.alpha_composite(pil_comp, Image.fromarray(sh_rgba, mode="RGBA"))
+
+    if float(edge_alpha.max()) > 1e-4:
+        pil_edge = premul_to_pil_rgba(edge_premul, edge_alpha)
+        pil_comp = Image.alpha_composite(pil_comp, pil_edge)
+
+    pil_comp = Image.alpha_composite(pil_comp, face_pil_rgba)
+
+    pil_rgb = pil_comp.convert("RGB")
+    if float(fx_add_rgb.max()) > 1e-4:
+        fx_u8 = np.clip(fx_add_rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        pil_fx = Image.fromarray(fx_u8, mode="RGB")
+        pil_rgb = ImageChops.add(pil_rgb, pil_fx)
+
+    return pil_rgb.resize((final_width, final_h), Image.Resampling.LANCZOS)
+
+
 def shade_card_face(
     theta: float,
     R: np.ndarray,
@@ -1450,9 +1546,8 @@ def shade_card_face(
     bevel_alpha = bevel_mask[..., None] * 0.88
     out = out * (1.0 - bevel_alpha) + rim_color * bevel_alpha
 
-    # Soft highlight roll-off (protects against blown-out pure white / harsh quantization blocks)
-    out = np.where(out > 0.86, 0.86 + 0.14 * np.tanh((out - 0.86) / 0.22), out)
-    out = np.clip(out, 0.0, 1.0).astype(np.float32)
+    # C^1 soft-knee highlight roll-off (protects against blown-out whites / harsh blocks)
+    out = apply_highlight_rolloff(out, knee=0.90, spread=0.10)
     return out, sweep_center
 
 
@@ -1696,12 +1791,16 @@ def export_shared_palette_gif(
     quality_tier: str = "hd",
 ) -> None:
     """
-    Build one subject-prioritized shared 256-color adaptive palette sampled across
-    all frames, then quantize every frame cleanly with Floyd-Steinberg dithering:
-      - Includes BOTH full-frame thumbnails (smooth studio backdrop gradients) AND
-        2x-weighted central card-subject crops so the 256-color palette dedicates
-        rich exact colors to skin tones, dark hair, shadows, and vivid clothing
-        instead of starving the subject and causing grey dithering washout!
+    Tri-Subpalette Shared 256-Color Quantizer + Floyd-Steinberg Dithering:
+      1. Allocates up to 54 Median-Cut palette entries strictly to dark pixels
+         (lum < 72) so dark hair, shadows, and studio backdrops stay velvety smooth
+         with zero dither speckle or frame-to-frame flicker.
+      2. Allocates up to 36 Median-Cut entries to neutral cel whites, soft shading,
+         and skin tones inside the card (`lum >= 72 & chroma < 58`) so anime cel
+         surfaces stay clean without pinkish/grey Floyd-Steinberg dot noise.
+      3. Allocates the remaining >=166 Fast-Octree palette entries from a 2x
+         subject-prioritized frame mosaic so vivid prismatic holographic lasers
+         retain smooth rainbow fidelity.
     """
     preset = GIF_QUALITY_PRESETS.get(quality_tier, GIF_QUALITY_PRESETS["hd"])
     sample_w = int(preset["palette_sample"])
@@ -1710,25 +1809,64 @@ def export_shared_palette_gif(
     sample_h = max(80, int(round(sample_w * (fh / max(1.0, float(fw))))))
 
     n = len(frames_rgb_u8)
-    # Build subject-prioritized mosaic: 1x full frame + 2x central card crop per sampled frame
     stride = 1 if n <= 24 else 2
-    sampled_idx = list(range(0, n, stride))
+    sampled_idx = set(range(0, n, stride))
     tiles: List[Image.Image] = []
     pil_frames: List[Image.Image] = []
+    dark_px_list: List[np.ndarray] = []
+    cel_px_list: List[np.ndarray] = []
 
     cx0, cx1 = int(fw * 0.14), int(fw * 0.86)
     cy0, cy1 = int(fh * 0.10), int(fh * 0.90)
 
+    def _extract_used_rgb(p_img: Image.Image) -> List[Tuple[int, int, int]]:
+        pal = p_img.getpalette() or []
+        out_cols: List[Tuple[int, int, int]] = []
+        for p_idx in np.unique(np.asarray(p_img)):
+            base = int(p_idx) * 3
+            if base + 2 < len(pal):
+                out_cols.append((pal[base], pal[base + 1], pal[base + 2]))
+        return out_cols
+
+    def _sample_mediancut_subpalette(px_chunks: List[np.ndarray], max_colors: int) -> List[Tuple[int, int, int]]:
+        if not px_chunks:
+            return []
+        all_px = np.concatenate(px_chunks, axis=0)
+        if len(all_px) < 1024:
+            return []
+        n_target = min(max_colors, max(12, len(all_px) // 256))
+        side = int(math.sqrt(len(all_px)))
+        sub_im = Image.fromarray(all_px[: side * side].reshape(side, side, 3), mode="RGB")
+        p_sub = sub_im.quantize(colors=n_target, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+        return _extract_used_rgb(p_sub)
+
     for idx, arr in enumerate(frames_rgb_u8):
         im = Image.fromarray(arr, mode="RGB")
         if sharpen_pct > 0:
-            im = im.filter(ImageFilter.UnsharpMask(radius=0.9, percent=sharpen_pct, threshold=3))
+            im = im.filter(ImageFilter.UnsharpMask(radius=0.9, percent=sharpen_pct, threshold=4))
         pil_frames.append(im)
         if idx in sampled_idx:
             tiles.append(im.resize((sample_w, sample_h), Image.Resampling.BILINEAR))
             card_crop = im.crop((cx0, cy0, cx1, cy1)).resize((sample_w, sample_h), Image.Resampling.BILINEAR)
             tiles.append(card_crop)
             tiles.append(card_crop)
+
+            arr_s = np.asarray(im, dtype=np.uint8) if sharpen_pct > 0 else arr
+            arr_f = arr_s.astype(np.float32)
+            lum = 0.299 * arr_f[..., 0] + 0.587 * arr_f[..., 1] + 0.114 * arr_f[..., 2]
+            dpx = arr_s[lum < 72.0]
+            if len(dpx) > 0:
+                step = max(1, len(dpx) // 4096)
+                dark_px_list.append(dpx[::step])
+
+            card_arr = arr_s[cy0:cy1, cx0:cx1]
+            card_f = arr_f[cy0:cy1, cx0:cx1]
+            clum = lum[cy0:cy1, cx0:cx1]
+            c_chroma = np.max(card_f, axis=-1) - np.min(card_f, axis=-1)
+            cpx = card_arr[(clum >= 72.0) & (c_chroma < 58.0)]
+            if len(cpx) > 0:
+                cstep = max(1, len(cpx) // 4096)
+                cel_px_list.append(cpx[::cstep])
 
     cols = 8
     rows = math.ceil(len(tiles) / cols)
@@ -1737,11 +1875,29 @@ def export_shared_palette_gif(
         r_idx, c_idx = divmod(i_t, cols)
         mosaic.paste(tile, (c_idx * sample_w, r_idx * sample_h))
 
-    # Build rich shared 256-color palette (FASTOCTREE preserves darks & vivid saturated colors better than MEDIANCUT)
+    dark_colors = _sample_mediancut_subpalette(dark_px_list, max_colors=54)
+    cel_colors = _sample_mediancut_subpalette(cel_px_list, max_colors=36)
+
+    n_main = max(128, 256 - len(set(dark_colors + cel_colors)))
     try:
-        palette_img = mosaic.quantize(colors=256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
+        p_main = mosaic.quantize(colors=n_main, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
     except Exception:
-        palette_img = mosaic.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+        p_main = mosaic.quantize(colors=n_main, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    p_fallback = mosaic.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+
+    seen = set()
+    merged: List[int] = []
+    for rgb in dark_colors + cel_colors + _extract_used_rgb(p_main) + _extract_used_rgb(p_fallback):
+        if rgb not in seen:
+            seen.add(rgb)
+            merged.extend(rgb)
+            if len(seen) >= 256:
+                break
+    while len(merged) < 768:
+        merged.extend((0, 0, 0))
+
+    palette_img = Image.new("P", (16, 16))
+    palette_img.putpalette(merged[:768])
 
     quantized_frames = [
         im.quantize(palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG)
@@ -1919,27 +2075,38 @@ def render_tarot_gif(
         blur_sigma = (22.0 + 10.0 * float_norm) * supersample
         shadow_soft = cv2.GaussianBlur(shadow_sil, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
         shadow_opacity = 0.58 - 0.14 * float_norm
-        canvas *= (1.0 - shadow_soft[..., None] * shadow_opacity)
+        shadow_alpha_map = np.clip(shadow_soft * shadow_opacity, 0.0, 1.0).astype(np.float32)
 
-        # 4. 8-layer solid metallic thickness slices (back-to-front painter's order)
+        # 4. 8-layer solid metallic thickness slices (Premultiplied-Alpha packed 4-ch warp, in-place)
+        edge_base_rgba = np.empty((card_h, card_w, 4), dtype=np.float32)
+        edge_base_rgba[..., :3] = (
+            shade_metallic_edge_slice(R, theta, card_data, brushed_tex, theme, 1.0)
+            * alpha_mask[..., None]
+        )
+        edge_base_rgba[..., 3] = alpha_mask
+        edge_premul = np.zeros((ss_canvas_h, ss_canvas_w, 3), dtype=np.float32)
+        edge_a = np.zeros((ss_canvas_h, ss_canvas_w), dtype=np.float32)
+        inv_buf = np.empty((ss_canvas_h, ss_canvas_w), dtype=np.float32)
+        one32 = np.float32(1.0)
         for k in range(thickness_layers, 0, -1):
             z_loc = thickness_total * (k / float(thickness_layers))
             slice_t = 1.0 - (k / float(thickness_layers))
-            edge_rgb = shade_metallic_edge_slice(R, theta, card_data, brushed_tex, theme, slice_t)
             H_slice = plane_homography_for_z(
                 card_w, card_h, R, z_loc, float_y, focal, canvas_cx, canvas_cy
             )
-            w_rgb = cv2.warpPerspective(
-                edge_rgb, H_slice, (ss_canvas_w, ss_canvas_h),
-                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0),
+            w_rgba = cv2.warpPerspective(
+                edge_base_rgba, H_slice, (ss_canvas_w, ss_canvas_h),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0, 0.0),
             )
-            w_a = cv2.warpPerspective(
-                alpha_mask, H_slice, (ss_canvas_w, ss_canvas_h),
-                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
-            )[..., None]
-            canvas = canvas * (1.0 - w_a) + w_rgb * w_a
+            w_a = np.clip(w_rgba[..., 3], 0.0, 1.0)
+            np.subtract(one32, w_a, out=inv_buf)
+            edge_premul *= inv_buf[..., None]
+            w_rgba[..., :3] *= np.float32(0.72 + 0.28 * slice_t)
+            edge_premul += w_rgba[..., :3]
+            edge_a *= inv_buf
+            edge_a += w_a
 
-        # 5. Front face with tarot holographic shader
+        # 5. Front face with tarot holographic shader (Premultiplied-Alpha warp -> Pillow RGBA)
         face_rgb, sweep_center = shade_card_face(
             theta, R, card_data, masks, etch_tex, grating_tex, uv_grid, theme,
             line_etch_scale=LINE_ETCH_SCALES.get(line_etch, 1.0),
@@ -1947,17 +2114,12 @@ def render_tarot_gif(
         H_front = plane_homography_for_z(
             card_w, card_h, R, 0.0, float_y, focal, canvas_cx, canvas_cy
         )
-        w_face = cv2.warpPerspective(
-            face_rgb, H_front, (ss_canvas_w, ss_canvas_h),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0),
+        face_pil_rgba = warp_premultiplied_to_pil_rgba(
+            face_rgb, alpha_mask, H_front, ss_canvas_w, ss_canvas_h
         )
-        w_face_a = cv2.warpPerspective(
-            alpha_mask, H_front, (ss_canvas_w, ss_canvas_h),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
-        )[..., None]
-        canvas = canvas * (1.0 - w_face_a) + w_face * w_face_a
 
-        # 6. Anchored card-face 4-point star glints (locked to H_front, synced to sweep)
+        # 6. Anchored card-face 4-point star glints & foreground bokeh into additive pass
+        fx_add = np.zeros((ss_canvas_h, ss_canvas_w, 3), dtype=np.float32)
         for ax, ay, size_scale in anchors:
             u_a = ax / max(1, card_w - 1)
             v_a = ay / max(1, card_h - 1)
@@ -1967,15 +2129,14 @@ def render_tarot_gif(
             pt = H_front @ np.array([ax, ay, 1.0], dtype=np.float64)
             gx, gy = float(pt[0] / pt[2]), float(pt[1] / pt[2])
             glint_rad = (15.0 + 18.0 * peak) * size_scale * (ss_canvas_w / 920.0)
-            draw_star_glint(canvas, gx, gy, glint_rad, glint_int, theme.metal_bright)
+            draw_star_glint(fx_add, gx, gy, glint_rad, glint_int, theme.metal_bright)
 
-        # 7. Foreground soft-focus bokeh particles
-        render_particles(canvas, fg_particles, theta)
+        render_particles(fx_add, fg_particles, theta)
 
-        # High-quality Lanczos downsample from supersampled canvas to final GIF dimensions
-        ss_u8 = np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        pil_ss = Image.fromarray(ss_u8, mode="RGB")
-        pil_final = pil_ss.resize((final_width, final_h), Image.Resampling.LANCZOS)
+        # 7. Pillow RGBA compositing + Lanczos downsample
+        pil_final = compose_studio_frame_pillow(
+            canvas, shadow_alpha_map, edge_premul, edge_a, face_pil_rgba, fx_add, final_width, final_h
+        )
         frames_final.append(np.asarray(pil_final, dtype=np.uint8))
 
     # Seam continuity check (Frame 47 -> Frame 0 vs average adjacent frame diff)

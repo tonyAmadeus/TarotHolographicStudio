@@ -62,10 +62,12 @@ from render_tarot_holographic import (
     RenderCancelledError,
     ThemeConfig,
     analyze_image_theme,
+    apply_highlight_rolloff,
     build_brushed_metal_edge_texture,
     build_even_durations,
     build_micro_etching_texture,
     build_rounded_rect_sdf,
+    compose_studio_frame_pillow,
     draw_star_glint,
     export_shared_palette_gif,
     extract_subject_alpha,
@@ -78,24 +80,25 @@ from render_tarot_holographic import (
     rotation_matrix_xyz,
     shade_metallic_edge_slice,
     spectral_iridescence,
+    warp_premultiplied_to_pil_rgba,
 )
 
 
 # ---------------------------------------------------------------------------
-# Periodic 3D Pose (Guarantees exact 0° frontal frame & both +/-17.5° peaks)
+# Periodic 3D Pose (Guarantees exact 0° frontal frame & both +/-19.5° peaks)
 # ---------------------------------------------------------------------------
 
 def compute_sar_frame_pose(theta: float, card_h: float) -> Tuple[float, float, float, float]:
     """
     Strictly 2*pi-periodic 3D orbital pose:
       - theta = 0 (frame 0)  -> exact 0° frontal view (rx=0, ry=0, rz=0)
-      - theta = pi/2, 3pi/2  -> +/-17.5° Y-axis max tilt peaks
-      - X-axis pitch +/-10.5° via sin(2*theta) for natural 3D figure-8 orbit
+      - theta = pi/2, 3pi/2  -> +/-19.5° Y-axis max tilt peaks
+      - X-axis pitch +/-11.5° via sin(2*theta) for natural 3D figure-8 orbit
       - Z-axis roll +/-2.0° via sin(theta)
       - Gentle vertical float bob via sin(theta)
     """
-    ry = math.radians(17.5) * math.sin(theta)
-    rx = math.radians(10.5) * math.sin(2.0 * theta)
+    ry = math.radians(19.5) * math.sin(theta)
+    rx = math.radians(11.5) * math.sin(2.0 * theta)
     rz = math.radians(2.0) * math.sin(theta)
     float_y = card_h * 0.022 * math.sin(theta + 0.45)
     return rx, ry, rz, float_y
@@ -277,10 +280,10 @@ def render_quicksand_layer(
     h, w = canvas.shape[:2]
 
     # 1. Two periodic + gravity/tilt-coupled mica-sand flow layers
-    sh1_x = int(round((-px * 0.052 + 0.024 * math.sin(theta)) * w))
-    sh1_y = int(round((-py * 0.052 + 0.020 * math.cos(theta)) * h))
-    sh2_x = int(round((-px * 0.036 - 0.020 * math.cos(theta)) * w))
-    sh2_y = int(round((-py * 0.036 + 0.026 * math.sin(theta)) * h))
+    sh1_x = int(round((-px * 0.068 + 0.024 * math.sin(theta)) * w))
+    sh1_y = int(round((-py * 0.068 + 0.020 * math.cos(theta)) * h))
+    sh2_x = int(round((-px * 0.048 - 0.020 * math.cos(theta)) * w))
+    sh2_y = int(round((-py * 0.048 + 0.026 * math.sin(theta)) * h))
 
     s1 = np.roll(np.roll(qs.sand_tex1, sh1_y, axis=0), sh1_x, axis=1)
     s2 = np.roll(np.roll(qs.sand_tex2, sh2_y, axis=0), sh2_x, axis=1)
@@ -311,8 +314,8 @@ def render_quicksand_layer(
     flake_cols = np.clip(qs.glitter_color * 0.58 + irid_flake * 0.48, 0.0, 1.0)
 
     # Strictly periodic gentle drift + stratified 3D depth parallax
-    cur_u = qs.glitter_u - px * 0.072 * qs.glitter_z + qs.glitter_amp_u * np.sin(theta + qs.glitter_phase)
-    cur_v = qs.glitter_v - py * 0.072 * qs.glitter_z + qs.glitter_amp_v * np.cos(theta + qs.glitter_phase * 1.2)
+    cur_u = qs.glitter_u - px * 0.094 * qs.glitter_z + qs.glitter_amp_u * np.sin(theta + qs.glitter_phase)
+    cur_v = qs.glitter_v - py * 0.094 * qs.glitter_z + qs.glitter_amp_v * np.cos(theta + qs.glitter_phase * 1.2)
     cur_u = np.mod(cur_u, 1.0)
     cur_v = np.mod(cur_v, 1.0)
 
@@ -393,9 +396,12 @@ def prepare_edge_extended_subject(
 @dataclass
 class MpiPlane:
     z_val: float
-    alpha: np.ndarray            # (H, W) float32 in [0, 1]
-    src_y: Optional[np.ndarray]  # (H, W) int16 when occlusion-extended, else None
-    src_x: Optional[np.ndarray]  # (H, W) int16 when occlusion-extended, else None
+    alpha: np.ndarray                     # (H, W) float32 in [0, 1] (core + disocclusion completion)
+    own_alpha: np.ndarray                 # (H, W) float32 in [0, 1] (native stratum only)
+    h_local: np.ndarray                   # (H, W) float32 continuous local height offset
+    src_y: Optional[np.ndarray]           # (H, W) float32 remap Y when disocclusion-extended
+    src_x: Optional[np.ndarray]           # (H, W) float32 remap X when disocclusion-extended
+    sidewall_mask: Optional[np.ndarray]   # (H, W) float32 cliff mask for narrow local bevels
     has_pixels: bool
 
 
@@ -405,17 +411,15 @@ def compute_sculpted_normals_and_ao(
     card_w: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute clean, organic 3D volumetric surface normals (nx, ny) and soft
-    screen-space crevice Ambient Occlusion (ao in [0, 1]) from the RGB-snapped
-    depth map:
+    Compute smooth C^1-continuous 3D volumetric surface normals (nx, ny) and
+    low-noise screen-space crevice Ambient Occlusion (ao in [0, 1]):
       1. Extrapolates interior depth outward solely for derivative calculation
          so outer silhouette cliffs NEVER cause harsh black border spikes.
-      2. Combines fine-detail curvature + broad anatomical form slopes so faces,
-         limbs, dress folds, and wings turn smoothly under studio lighting.
-      3. Adds subtle organic silhouette edge-rounding in the outermost ~5px rim
-         so the subject feels sculpted rather than flat cardboard.
+      2. Blends smooth fine + broad curvature slopes + gentle smoothing pass so
+         cel-shaded skin/dress tones stay silky with zero grain.
+      3. Adds subtle organic silhouette edge-rounding in the outermost ~5px rim.
       4. Computes soft concave crevice AO where deeper body parts tuck behind
-         closer layers (under sleeves, bangs, hands, skirt folds).
+         closer layers.
     """
     h, w = depth_map.shape[:2]
     valid = (subj_alpha > 0.15) & (depth_map > 0.02)
@@ -433,20 +437,18 @@ def compute_sculpted_normals_and_ao(
     else:
         d_ext = depth_map.astype(np.float32)
 
-    # Multi-scale volumetric curvature gradients
-    d_fine = cv2.GaussianBlur(d_ext, (0, 0), sigmaX=max(2.0, card_w * 0.0055))
-    d_broad = cv2.GaussianBlur(d_ext, (0, 0), sigmaX=max(6.0, card_w * 0.018))
+    # Smooth multi-scale volumetric curvature gradients
+    d_fine = cv2.GaussianBlur(d_ext, (0, 0), sigmaX=max(3.0, card_w * 0.0080))
+    d_broad = cv2.GaussianBlur(d_ext, (0, 0), sigmaX=max(7.5, card_w * 0.023))
     gx_f = cv2.Sobel(d_fine, cv2.CV_32F, 1, 0, ksize=3)
     gy_f = cv2.Sobel(d_fine, cv2.CV_32F, 0, 1, ksize=3)
     gx_b = cv2.Sobel(d_broad, cv2.CV_32F, 1, 0, ksize=3)
     gy_b = cv2.Sobel(d_broad, cv2.CV_32F, 0, 1, ksize=3)
 
-    # Suppress extreme vertical cliff spikes (depth jumps between separate parts)
-    # while keeping rich organic curvature on continuous surfaces!
-    scale_f = card_w * 0.036
-    scale_b = card_w * 0.085
-    nx = -(np.tanh(gx_f * scale_f) * 0.34 + np.tanh(gx_b * scale_b) * 0.38)
-    ny = -(np.tanh(gy_f * scale_f) * 0.34 + np.tanh(gy_b * scale_b) * 0.38)
+    scale_f = card_w * 0.028
+    scale_b = card_w * 0.078
+    nx = -(np.tanh(gx_f * scale_f) * 0.26 + np.tanh(gx_b * scale_b) * 0.42)
+    ny = -(np.tanh(gy_f * scale_f) * 0.26 + np.tanh(gy_b * scale_b) * 0.42)
 
     # Gentle organic cylindrical rounding along outermost silhouette rim
     if not np.all(valid):
@@ -457,20 +459,22 @@ def compute_sculpted_normals_and_ao(
         rx_g = -cv2.Sobel(dt_s, cv2.CV_32F, 1, 0, ksize=3)
         ry_g = -cv2.Sobel(dt_s, cv2.CV_32F, 0, 1, ksize=3)
         rnorm = np.sqrt(rx_g * rx_g + ry_g * ry_g) + 1e-5
-        nx = nx + (rx_g / rnorm) * rim_w * 0.26
-        ny = ny + (ry_g / rnorm) * rim_w * 0.26
+        nx = nx + (rx_g / rnorm) * rim_w * 0.22
+        ny = ny + (ry_g / rnorm) * rim_w * 0.22
 
-    # Clamp XY normal magnitude cleanly so nz stays positive & smooth
+    # Clamp XY normal magnitude cleanly and smooth normals for porcelain cel shading
     n_len = np.sqrt(nx * nx + ny * ny)
-    max_xy = 0.68
+    max_xy = 0.60
     clamp_s = np.where(n_len > max_xy, max_xy / np.maximum(n_len, 1e-6), 1.0)
-    nx = (nx * clamp_s * subj_alpha).astype(np.float32)
-    ny = (ny * clamp_s * subj_alpha).astype(np.float32)
+    nx = cv2.GaussianBlur((nx * clamp_s).astype(np.float32), (0, 0), sigmaX=1.2) * subj_alpha
+    ny = cv2.GaussianBlur((ny * clamp_s).astype(np.float32), (0, 0), sigmaX=1.2) * subj_alpha
+    nx = nx.astype(np.float32)
+    ny = ny.astype(np.float32)
 
-    # Soft Screen-Space Depth Ambient Occlusion (crevices where neighbors are significantly nearer)
-    d_hood = cv2.GaussianBlur(d_ext, (0, 0), sigmaX=max(8.0, card_w * 0.024))
-    ao = np.clip((d_hood - d_ext - 0.025) * 4.2, 0.0, 1.0) * subj_alpha
-    ao = cv2.GaussianBlur(ao, (0, 0), sigmaX=2.0).astype(np.float32)
+    # Low-noise Screen-Space Depth Ambient Occlusion
+    d_hood = cv2.GaussianBlur(d_ext, (0, 0), sigmaX=max(9.0, card_w * 0.026))
+    ao = np.clip((d_hood - d_ext - 0.028) * 3.4, 0.0, 1.0) * subj_alpha
+    ao = cv2.GaussianBlur(ao, (0, 0), sigmaX=2.6).astype(np.float32)
     return nx, ny, ao
 
 
@@ -479,82 +483,161 @@ def build_mpi_layers(
     subj_alpha: np.ndarray,
     card_w: int,
     n_planes: int = 14,
+    line_mask: Optional[np.ndarray] = None,
 ) -> List[MpiPlane]:
     """
-    Decompose the 3D subject into `n_planes` back-to-front Multi-Plane Image (MPI)
-    depth strata with occlusion-aware peek-behind extension:
-      - Zero-leak Porter-Duff overlap guarantees 100% pixel-exact identity at 0°.
-      - Deeper layers cleanly extend their own pixels behind closer foreground
-        occluders (e.g., hair/wings behind an outstretched hand or sleeve), while
-        strictly respecting open-air silhouette boundaries (`dist_to_own <= dist_to_bg`),
-        completely eliminating rubber-sheet stretching, gaps, and thick block edges!
+    Build hybrid 14-stratum 3D scene representation combining:
+      1. Smooth continuous local heightfield (`h_local`) per stratum for within-layer
+         Depth Warping / Relief Mapping (zero cardboard slicing!).
+      2. Foreground depth-cliff `sidewall_mask` for delicate ~2.0-2.8px local 3D bevels.
+      3. Non-ink occlusion-aware peek-behind disocclusion completion (`src_y, src_x`)
+         that excludes drawn outlines and respects open-air boundaries.
     """
     h, w = depth_map.shape[:2]
     fg_mask = subj_alpha > 0.06
     if not np.any(fg_mask):
         return []
 
-    z_vals = np.linspace(0.06, 1.00, n_planes).astype(np.float32)
-    step = float(z_vals[1] - z_vals[0]) if n_planes > 1 else 1.0
-    inpaint_px = max(7.0, float(card_w) * 0.024)
+    # Adaptive Quantile + Uniform hybrid depth strata: allocates denser planes to
+    # where the subject actually sits (fixes wasted gap strata on full-scene/skewed depths!)
+    z_unif = np.linspace(0.06, 1.00, n_planes).astype(np.float32)
+    fg_d = depth_map[fg_mask]
+    if n_planes > 2 and len(fg_d) > 64:
+        q_grid = np.linspace(0.0, 1.0, n_planes)
+        z_quant = np.quantile(fg_d, q_grid).astype(np.float32)
+        z_blend = (0.50 * z_unif + 0.50 * z_quant).astype(np.float32)
+        z_blend[0] = min(0.06, float(z_quant[0]))
+        z_blend[-1] = 1.00
+        min_gap = 0.022
+        for k_i in range(1, n_planes):
+            if z_blend[k_i] < z_blend[k_i - 1] + min_gap:
+                z_blend[k_i] = z_blend[k_i - 1] + min_gap
+        z_vals = (0.06 + 0.94 * (z_blend - z_blend[0]) / max(1e-5, float(z_blend[-1] - z_blend[0]))).astype(np.float32)
+    else:
+        z_vals = z_unif
 
-    # Distance from each foreground pixel to open transparent air (guards thin limbs!)
+    inpaint_px = max(10.0, float(card_w) * 0.034)
+
     has_bg_air = bool(np.any(subj_alpha < 0.20))
     if has_bg_air:
         dist_to_bg = cv2.distanceTransform((subj_alpha >= 0.20).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
     else:
         dist_to_bg = np.full((h, w), 1e5, dtype=np.float32)
 
-    yy_id, xx_id = np.mgrid[0:h, 0:w].astype(np.int16)
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k3_rect = np.ones((3, 3), np.uint8)
+    d_min5 = cv2.erode(depth_map, k5, borderType=cv2.BORDER_REPLICATE)
+
+    yy_id, xx_id = np.mgrid[0:h, 0:w].astype(np.float32)
     planes: List[MpiPlane] = []
 
     for k in range(n_planes):
         zk = float(z_vals[k])
-        z_prev = zk - step
-        z_next = zk + step
+        z_prev = float(z_vals[k - 1]) if k > 0 else (zk - max(0.04, float(z_vals[1] - zk) if n_planes > 1 else 0.07))
+        z_next = float(z_vals[k + 1]) if k < n_planes - 1 else (zk + max(0.04, zk - z_prev))
+        step_lo = max(1e-4, zk - z_prev)
+        step_hi = max(1e-4, z_next - zk)
 
-        # Solid back-support in [zk, z_next] + smooth crossfade feather in [z_prev, zk)
         if k == 0:
             in_solid = fg_mask & (depth_map <= z_next)
             base_a = np.where(in_solid, subj_alpha, 0.0).astype(np.float32)
         else:
             in_solid = fg_mask & (depth_map >= zk) & (depth_map <= z_next)
             in_ramp = fg_mask & (depth_map >= z_prev) & (depth_map < zk)
-            ramp_w = np.clip((depth_map - z_prev) / max(1e-5, step), 0.0, 1.0)
+            ramp_w = np.clip((depth_map - z_prev) / step_lo, 0.0, 1.0)
             base_a = np.where(in_solid, subj_alpha, np.where(in_ramp, ramp_w * subj_alpha, 0.0)).astype(np.float32)
 
+        in_native = base_a > 0.01
         own_core = base_a > 0.30
         if not np.any(own_core):
-            planes.append(MpiPlane(z_val=zk, alpha=base_a, src_y=None, src_x=None, has_pixels=bool(np.any(base_a > 0.01))))
+            planes.append(
+                MpiPlane(
+                    z_val=zk,
+                    alpha=base_a,
+                    own_alpha=base_a,
+                    h_local=np.zeros((h, w), dtype=np.float32),
+                    src_y=None,
+                    src_x=None,
+                    sidewall_mask=None,
+                    has_pixels=bool(np.any(in_native)),
+                )
+            )
             continue
 
-        # Pixels strictly occluded by a significantly nearer foreground body part
-        occluded = (subj_alpha > 0.15) & (depth_map > zk + step * 1.05)
+        # Smooth continuous local heightfield matching asymmetric neighbor spacing cleanly
+        h_raw = np.clip(depth_map - zk, -step_lo, step_hi).astype(np.float32)
+        if not np.all(in_native):
+            inv_nat = (~in_native).astype(np.uint8)
+            d_nat, lbl_nat = cv2.distanceTransformWithLabels(inv_nat, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+            nat_coords = np.argwhere(in_native)
+            nat_idx = np.clip(lbl_nat - 1, 0, len(nat_coords) - 1)
+            h_near = h_raw[nat_coords[nat_idx, 0], nat_coords[nat_idx, 1]]
+            h_ext = np.where(in_native, h_raw, np.where(d_nat <= 3.0, h_near, 0.0)).astype(np.float32)
+        else:
+            h_ext = h_raw
+
+        # Foreground depth-cliff detection for subtle local 3D bevel sidewalls
+        sw_mask: Optional[np.ndarray] = None
+        if k >= 2:
+            is_cliff = own_core & ((depth_map - d_min5) > 0.12)
+            if np.any(is_cliff):
+                sw_dil = cv2.dilate(is_cliff.astype(np.uint8), k3_rect).astype(np.float32)
+                sw_mask = np.clip(cv2.GaussianBlur(sw_dil, (3, 3), 0.7) * base_a, 0.0, 1.0).astype(np.float32)
+
+        # Disocclusion completion behind nearer foreground occluders (excluding dark ink outlines!)
+        occluded = (subj_alpha > 0.15) & (depth_map > z_next + 0.015)
         if np.any(occluded) and k < n_planes - 1:
-            # Source disocclusion colors from 2px cleanly inside `own_core` (away from
-            # foreground transition pixels) so mixed hair/skin boundary pixels NEVER bleed!
-            occ_dil = cv2.dilate(occluded.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+            occ_dil = cv2.dilate(occluded.astype(np.uint8), k5) > 0
             clean_src = own_core & (~occ_dil)
+            if line_mask is not None:
+                non_ink = clean_src & (line_mask < 0.25)
+                if np.any(non_ink):
+                    clean_src = non_ink
             if not np.any(clean_src):
                 clean_src = own_core
             inv_own = (~clean_src).astype(np.uint8)
             dist_own, labels = cv2.distanceTransformWithLabels(inv_own, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
-            # Only extend where closer to this layer than to open air (prevents bleeding past thin limbs!)
-            ext_mask = occluded & (dist_own <= inpaint_px + 2.0) & (dist_own <= dist_to_bg + 2.5)
+            ext_mask = occluded & (dist_own <= inpaint_px + 2.5) & (dist_own <= dist_to_bg + 2.5)
             if np.any(ext_mask):
                 coords = np.argwhere(clean_src)
                 idx = np.clip(labels - 1, 0, len(coords) - 1)
-                near_y = coords[idx, 0].astype(np.int16)
-                near_x = coords[idx, 1].astype(np.int16)
-                src_y = np.where(ext_mask, near_y, yy_id).astype(np.int16)
-                src_x = np.where(ext_mask, near_x, xx_id).astype(np.int16)
-                # Smoothly feather the far edge of the hidden extension zone
-                ext_falloff = np.clip(1.0 - np.maximum(0.0, dist_own - inpaint_px * 0.65) / max(1.0, inpaint_px * 0.45), 0.0, 1.0)
+                near_y = coords[idx, 0].astype(np.float32)
+                near_x = coords[idx, 1].astype(np.float32)
+                src_y = np.where(ext_mask, near_y, yy_id).astype(np.float32)
+                src_x = np.where(ext_mask, near_x, xx_id).astype(np.float32)
+                ext_falloff = np.clip(
+                    1.0 - np.maximum(0.0, dist_own - inpaint_px * 0.65) / max(1.0, inpaint_px * 0.45),
+                    0.0,
+                    1.0,
+                )
                 plane_a = np.where(ext_mask, np.maximum(base_a, subj_alpha * ext_falloff), base_a).astype(np.float32)
-                planes.append(MpiPlane(z_val=zk, alpha=plane_a, src_y=src_y, src_x=src_x, has_pixels=True))
+                h_local = np.where(ext_mask, 0.0, h_ext).astype(np.float32)
+                planes.append(
+                    MpiPlane(
+                        z_val=zk,
+                        alpha=plane_a,
+                        own_alpha=base_a,
+                        h_local=h_local,
+                        src_y=src_y,
+                        src_x=src_x,
+                        sidewall_mask=sw_mask,
+                        has_pixels=True,
+                    )
+                )
                 continue
 
-        planes.append(MpiPlane(z_val=zk, alpha=base_a, src_y=None, src_x=None, has_pixels=True))
+        planes.append(
+            MpiPlane(
+                z_val=zk,
+                alpha=base_a,
+                own_alpha=base_a,
+                h_local=h_ext,
+                src_y=None,
+                src_x=None,
+                sidewall_mask=sw_mask,
+                has_pixels=True,
+            )
+        )
 
     return planes
 
@@ -569,13 +652,17 @@ def render_mpi_subject(
     base_xx: np.ndarray,
     base_yy: np.ndarray,
     is_opaque_full: bool = False,
+    z_pivot: float = 0.54,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Render the shaded 3D subject via Premultiplied-Alpha Multi-Plane Image (MPI)
-    warping (back-to-front). Returns (warped_rgb, warped_alpha):
-      - At 0° frontal view (px=py=0): exact 1:1 pixel identity with `s_shaded`.
-      - At tilted angles: smooth, natural, organic 3D depth separation & peeking
-        behind foreground limbs/sleeves with zero rubber-wall stretching or slab edges!
+    Packed 4-channel float32 Hybrid Premultiplied-Alpha 3D Renderer (back-to-front
+    painter's order for exact self-occlusion):
+      - Within each depth stratum: 2-step damped continuous Depth Warping / Relief
+        Mapping over `h_local` for silky curved volumetric surfaces.
+      - Along foreground depth cliffs: smooth single-pass ~2.0-2.8px local 3D bevel
+        sidewalls using edge pigment tinting (0.93 brightness, zero muddy blocks).
+      - Behind foreground occluders: fast cv2.remap non-ink disocclusion completion.
+      - At 0° frontal view: exact 1:1 pixel identity with `s_shaded`.
     """
     dx_max = px * relief_px
     dy_max = py * relief_px
@@ -587,35 +674,89 @@ def render_mpi_subject(
     acc_premul = np.zeros((h, w, 3), dtype=np.float32)
     acc_a = np.zeros((h, w), dtype=np.float32)
 
-    # Subtle radial lens foreshortening tied strictly to tilt magnitude (0 at 0°!)
-    tilt_mag = min(1.0, math.hypot(px, py) / 0.32)
-    rad_scale = 0.020 * tilt_mag * (relief_px / max(1.0, w * 0.068))
-    rad_dx = (base_xx - (w - 1) * 0.5) * rad_scale
-    rad_dy = (base_yy - (h - 1) * 0.5) * rad_scale
-    z_pivot = 0.54
+    tilt_mag = min(1.0, math.hypot(px, py) / 0.36)
+    rad_scale = np.float32(0.028 * tilt_mag * (relief_px / max(1.0, w * 0.102)))
+    rad_dx = (base_xx - np.float32((w - 1) * 0.5)) * rad_scale
+    rad_dy = (base_yy - np.float32((h - 1) * 0.5)) * rad_scale
+    shift_x = (np.float32(dx_max) - rad_dx).astype(np.float32)
+    shift_y = (np.float32(dy_max) - rad_dy).astype(np.float32)
+    z_pivot_f32 = np.float32(z_pivot)
+    half32 = np.float32(0.5)
+    one32 = np.float32(1.0)
+
+    shift_norm = math.hypot(dx_max, dy_max)
+    max_sw_px = max(2.0, min(2.8, float(w) * 0.0038))
+    sw_dz = np.float32(min(0.052, max_sw_px / max(1.0, shift_norm)))
+    sw_step = np.float32(0.75) * sw_dz
+    sw_shade = np.float32(0.93)
+
+    pl_buf = np.empty((h, w, 4), dtype=np.float32)
+    sw_buf = np.empty((h, w, 4), dtype=np.float32)
 
     for idx, pl in enumerate(mpi_planes):
         if not pl.has_pixels:
             continue
-        off = pl.z_val - z_pivot
-        map_x = (base_xx + off * dx_max - off * rad_dx).astype(np.float32)
-        map_y = (base_yy + off * dy_max - off * rad_dy).astype(np.float32)
+        off_base = np.float32(pl.z_val) - z_pivot_f32
 
+        # 2-step continuous Depth Warping / Relief Mapping within stratum
+        mx0 = base_xx + off_base * shift_x
+        my0 = base_yy + off_base * shift_y
+        dh1 = cv2.remap(pl.h_local, mx0, my0, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+        off1 = off_base + dh1
+        dh2 = cv2.remap(
+            pl.h_local,
+            base_xx + off1 * shift_x,
+            base_yy + off1 * shift_y,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        off_final = off_base + half32 * (dh1 + dh2)
+
+        map_x = base_xx + off_final * shift_x
+        map_y = base_yy + off_final * shift_y
+
+        # Smooth single-pass Premultiplied-Alpha local sidewall bevels on foreground cliffs
+        if tilt_mag > 0.03 and pl.sidewall_mask is not None:
+            off_sw = off_final - sw_step
+            sw_mx = base_xx + off_sw * shift_x
+            sw_my = base_yy + off_sw * shift_y
+            sw_a_src = pl.sidewall_mask
+            np.multiply(s_shaded, sw_a_src[..., None] * sw_shade, out=sw_buf[..., :3])
+            sw_buf[..., 3] = sw_a_src
+            w_sw = cv2.remap(
+                sw_buf,
+                sw_mx,
+                sw_my,
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0.0, 0.0, 0.0, 0.0),
+            )
+            sw_a = np.clip(w_sw[..., 3], 0.0, 1.0)
+            inv_sw = one32 - sw_a
+            acc_premul *= inv_sw[..., None]
+            acc_premul += w_sw[..., :3]
+            acc_a *= inv_sw
+            acc_a += sw_a
+
+        # Front stratum surface + non-ink disocclusion completion (self-occludes deeper layers & sidewalls)
         if pl.src_y is not None and pl.src_x is not None:
-            pl_rgb = s_shaded[pl.src_y, pl.src_x]
+            pl_rgb = cv2.remap(s_shaded, pl.src_x, pl.src_y, cv2.INTER_NEAREST)
         else:
             pl_rgb = s_shaded
 
-        pl_premul = (pl_rgb * pl.alpha[..., None]).astype(np.float32)
+        np.multiply(pl_rgb, pl.alpha[..., None], out=pl_buf[..., :3])
+        pl_buf[..., 3] = pl.alpha
         bmode = cv2.BORDER_REPLICATE if (is_opaque_full and idx == 0) else cv2.BORDER_CONSTANT
 
-        w_premul = cv2.remap(pl_premul, map_x, map_y, cv2.INTER_LINEAR, borderMode=bmode, borderValue=(0.0, 0.0, 0.0))
-        w_a = cv2.remap(pl.alpha, map_x, map_y, cv2.INTER_LINEAR, borderMode=bmode, borderValue=0.0)
-        w_a = np.clip(w_a, 0.0, 1.0)
+        w_pl = cv2.remap(pl_buf, map_x, map_y, cv2.INTER_LINEAR, borderMode=bmode, borderValue=(0.0, 0.0, 0.0, 0.0))
+        w_a = np.clip(w_pl[..., 3], 0.0, 1.0)
 
-        inv_a = 1.0 - w_a
-        acc_premul = acc_premul * inv_a[..., None] + w_premul
-        acc_a = acc_a * inv_a + w_a
+        inv_a = one32 - w_a
+        acc_premul *= inv_a[..., None]
+        acc_premul += w_pl[..., :3]
+        acc_a *= inv_a
+        acc_a += w_a
 
     acc_a = np.clip(acc_a, 0.0, 1.0).astype(np.float32)
     out_rgb = np.where(
@@ -681,6 +822,8 @@ def render_3layer_sar_gif(
     bg_mode: str = "auto",
     line_etch: str = "medium",
     depth_engine: str = "auto",
+    invert_depth: bool = False,
+    depth_gamma: float = 1.0,
     quicksand_strength: float = 1.0,
     relief_strength: float = 1.0,
     enable_dof: bool = True,
@@ -751,7 +894,7 @@ def render_3layer_sar_gif(
     card_h = inner_h + 2 * pad
 
     focal = float(card_h * 2.65)
-    thickness_total = float(card_w * 0.017)
+    thickness_total = float(card_w * 0.021)
     ss_canvas_w, ss_canvas_h, scale_adj = precompute_sar_canvas_size(
         card_w, card_h, n_frames, thickness_total, focal, ss_canvas_w
     )
@@ -763,7 +906,7 @@ def render_3layer_sar_gif(
         card_w = inner_w + 2 * pad
         card_h = inner_h + 2 * pad
         focal = float(card_h * 2.65)
-        thickness_total = float(card_w * 0.017)
+        thickness_total = float(card_w * 0.021)
         ss_canvas_w, ss_canvas_h, _ = precompute_sar_canvas_size(
             card_w, card_h, n_frames, thickness_total, focal, final_width * supersample
         )
@@ -811,12 +954,15 @@ def render_3layer_sar_gif(
     work_a = np.clip(cv2.resize(subj_alpha_raw, (work_w, work_h), interpolation=cv2.INTER_AREA), 0.0, 1.0).astype(np.float32)
 
     # Monocular depth map aligned 1:1 with the full uncropped subject first
+    # (geometrically aligned only here so CIE Lab color-guided refinement runs ONCE at card resolution!)
     if not np.any(work_a > 0.1):
         work_d = np.zeros((work_h, work_w), dtype=np.float32)
         depth_source_desc = "empty_preview"
     elif depth_path and os.path.isfile(depth_path):
         raw_d, depth_bits = load_depth_map_f32(depth_path)
-        work_d = align_and_refine_depth_map(raw_d, work_a, use_ecc=True, guide_rgb=work_rgb)
+        work_d = align_and_refine_depth_map(
+            raw_d, work_a, use_ecc=True, align_only=True, invert_depth=invert_depth
+        )
         depth_source_desc = f"aligned({depth_bits}):{os.path.basename(depth_path)}"
     else:
         use_ai = False
@@ -856,6 +1002,8 @@ def render_3layer_sar_gif(
         else:
             work_d = estimate_depth_fast(work_rgb, work_a)
             depth_source_desc = "auto_fast"
+        if invert_depth and np.any(work_a > 0.04):
+            work_d = np.where(work_a > 0.04, np.clip(1.06 - work_d, 0.06, 1.0), 0.0).astype(np.float32)
 
     # Full-bleed placement for opaque full-scene photos/paintings (eliminates border slit!),
     # inner-window fit for cutout characters so the etched holographic background & quicksand shine around them.
@@ -879,16 +1027,29 @@ def render_3layer_sar_gif(
     is_opaque_full = bool(np.mean(subj_alpha > 0.90) > 0.94)
 
     if np.any(subj_alpha > 0.1) and depth_placed is not None:
-        depth_map = align_and_refine_depth_map(depth_placed, subj_alpha, use_ecc=False, guide_rgb=subj_rgb)
+        depth_map = align_and_refine_depth_map(
+            depth_placed, subj_alpha, use_ecc=False, guide_rgb=subj_rgb, depth_gamma=depth_gamma
+        )
     else:
         depth_map = np.zeros((card_h, card_w), dtype=np.float32)
+
+    # Dynamic 3D depth pivot anchored to the subject's foreground median depth
+    fg_pivot_mask = (subj_alpha > 0.15) & (depth_map > 0.04)
+    z_pivot = float(np.clip(np.median(depth_map[fg_pivot_mask]), 0.36, 0.72)) if np.any(fg_pivot_mask) else 0.54
+
+    # Precompute 3 depth-elevation shadow strata (low=grounded crisp contact, high=floating wide penumbra)
+    w_sh_low = np.clip((0.42 - depth_map) / 0.24, 0.0, 1.0)
+    w_sh_high = np.clip((depth_map - 0.62) / 0.24, 0.0, 1.0)
+    w_sh_mid = np.clip(1.0 - w_sh_low - w_sh_high, 0.0, 1.0)
+    w_sh_sum = np.maximum(w_sh_low + w_sh_mid + w_sh_high, 1e-5)
+    a_sh_low = (subj_alpha * (w_sh_low / w_sh_sum)).astype(np.float32)
+    a_sh_mid = (subj_alpha * (w_sh_mid / w_sh_sum)).astype(np.float32)
+    a_sh_high = (subj_alpha * (w_sh_high / w_sh_sum)).astype(np.float32)
 
     # Organic 3D sculpted surface normals + soft crevice Ambient Occlusion (zero outer edge spikes!)
     depth_nx, depth_ny, depth_ao = compute_sculpted_normals_and_ao(depth_map, subj_alpha, card_w)
     depth_nz = -np.sqrt(np.clip(1.0 - depth_nx * depth_nx - depth_ny * depth_ny, 0.30, 1.0)).astype(np.float32)
 
-    # Precompute Occlusion-Aware 14-Plane Multi-Plane Image (MPI) depth strata
-    mpi_planes = build_mpi_layers(depth_map, subj_alpha, card_w=card_w, n_planes=14)
     eroded_subj_a = cv2.erode((subj_alpha > 0.45).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(np.float32)
     fresnel_edge_base = np.clip(subj_alpha - cv2.GaussianBlur(eroded_subj_a, (0, 0), sigmaX=1.6), 0.0, 1.0).astype(np.float32)
 
@@ -910,6 +1071,9 @@ def render_3layer_sar_gif(
     skin_blur = cv2.GaussianBlur(subj_skin, (0, 0), sigmaX=max(6.0, card_w * 0.025))
     face_protect_full = np.clip(skin_blur * 2.3 * np.clip(1.25 - iy / max(1.0, card_h * 0.48), 0.0, 1.0), 0.0, 0.88).astype(np.float32)
     line_mask = (line_raw * (1.0 - face_protect_full * 0.80) * subj_alpha).astype(np.float32)
+
+    # Precompute Hybrid 14-Stratum 3D Representation (excluding ink lines from disocclusion fill!)
+    mpi_planes = build_mpi_layers(depth_map, subj_alpha, card_w=card_w, n_planes=14, line_mask=line_mask)
 
     # Metallic/jewelry ornament zones on subject (strictly bright gold/specular highlights, never dark shadows/hair!)
     sgx = cv2.Sobel(subj_lum, cv2.CV_32F, 1, 0, ksize=3)
@@ -954,6 +1118,7 @@ def render_3layer_sar_gif(
         fg_rgb_dof, fg_alpha_dof = blur_premultiplied_rgba(fg_rgb, fg_alpha, sigma=max(0.5, 0.72 * supersample))
     else:
         fg_rgb_dof, fg_alpha_dof = fg_rgb, fg_alpha
+    fg_premul_dof = (fg_rgb_dof * fg_alpha_dof[..., None]).astype(np.float32)
     fg_gx = cv2.Sobel(fg_alpha, cv2.CV_32F, 1, 0, ksize=3)
     fg_gy = cv2.Sobel(fg_alpha, cv2.CV_32F, 0, 1, ksize=3)
 
@@ -1003,11 +1168,10 @@ def render_3layer_sar_gif(
 
     canvas_cx = ss_canvas_w * 0.5
     canvas_cy = ss_canvas_h * 0.5
-    # Physically calibrated shadowbox layer parallax depths (subject stays strictly inside
-    # the crystal cavity behind the raised foreground frame and in front of the background!)
-    bg_parallax_px = card_w * 0.084
-    fg_parallax_px = card_w * 0.036
-    relief_px = card_w * 0.068 * max(0.0, relief_strength)
+    # Physically calibrated deep shadowbox parallax depths (strong 3D relief & cavity separation)
+    bg_parallax_px = card_w * 0.118
+    fg_parallax_px = card_w * 0.048
+    relief_px = card_w * 0.102 * max(0.0, relief_strength)
 
     # Precompute atmospheric studio backdrop behind the floating 3D card (non-pure-black!)
     base_studio_bg: Optional[np.ndarray] = None
@@ -1030,7 +1194,7 @@ def render_3layer_sar_gif(
         if cancel_event is not None and cancel_event.is_set():
             raise RenderCancelledError("渲染已取消")
         if single_frame_theta is None:
-            _report(i + 1, total_steps, f"正在渲染第 {i + 1}/{n_frames} 帧 (三层景深 + 流麻 + Relief Mapping)...")
+            _report(i + 1, total_steps, f"正在渲染第 {i + 1}/{n_frames} 帧 (3D景深/Relief + 赛璐珞光照 + 全息镭射)...")
 
         rx, ry, rz, float_y = compute_sar_frame_pose(theta, card_h)
         R = rotation_matrix_xyz(rx, ry, rz)
@@ -1067,7 +1231,8 @@ def render_3layer_sar_gif(
         etch_w = cv2.remap(etch_tex, bg_map_x, bg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
         grat_w = cv2.remap(grating_tex, bg_map_x, bg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
-        # Shared two-layer iridescent foil waves
+        # Shared multi-layer holographic laser & iridescent diffraction waves (strictly periodic in theta)
+        diag_coord = u_norm * 0.70 + v_norm * 0.30
         diag1 = u_norm * 0.76 + v_norm * 0.44
         phase1 = (
             theme.irid_phase_shift
@@ -1084,11 +1249,18 @@ def render_3layer_sar_gif(
             + float(local_half[1]) * 5.8
             + etch_w * 1.15
         )
-        irid_mix = (spectral_iridescence(phase1) * 0.58 + spectral_iridescence(phase2) * 0.42) * 0.74 + theme.metal_base[None, None, :] * 0.26
+        irid_mix = (spectral_iridescence(phase1) * 0.58 + spectral_iridescence(phase2) * 0.42) * 0.80 + theme.metal_base[None, None, :] * 0.20
+        laser_phase = (
+            theme.irid_phase_shift + 0.95
+            + diag_coord * 13.5
+            + theta * 2.0
+            + float(local_half[0]) * 8.5
+            + grat_w * 1.40
+        )
+        laser_prism = spectral_iridescence(laser_phase)
+        bg_laser = irid_mix * 0.72 + laser_prism * 0.28
 
         # Seamless periodic glass specular sweep & moving spotlight
-        # Keep broad sweep for background foil, and crisp narrow beam for surface glass sheen (zero milky fog!)
-        diag_coord = u_norm * 0.70 + v_norm * 0.30
         sweep_center = 0.50 + 0.64 * math.sin(theta - 0.35)
         sweep_band = np.exp(-0.5 * ((diag_coord - sweep_center) / 0.11) ** 2).astype(np.float32)
         sweep_sharp = np.exp(-0.5 * ((diag_coord - sweep_center) / 0.052) ** 2).astype(np.float32)
@@ -1097,25 +1269,51 @@ def render_3layer_sar_gif(
         spot_y = 0.46 - 0.22 * math.cos(theta + 0.25)
         spot = np.exp(-0.5 * (((u_norm - spot_x) / 0.36) ** 2 + ((v_norm - spot_y) / 0.38) ** 2)).astype(np.float32)
 
-        # Apply Pokémon-grade zoned background holographics (mainly in dark/low-detail regions)
+        # Apply Pokémon-grade zoned background holographics + holographic laser beam in recessed backdrop
         angle_boost = 0.68 + 0.32 * abs(math.sin(theta + 0.25))
-        bg_foil_w = bg_dark_w * (0.16 + 0.34 * etch_w + 0.16 * grat_w) * angle_boost * inten
-        card_face = card_face + irid_mix * bg_foil_w[..., None] * (1.0 - card_face * 0.35)
+        bg_foil_w = bg_dark_w * (0.18 + 0.38 * etch_w + 0.18 * grat_w) * angle_boost * inten
+        card_face = card_face + bg_laser * bg_foil_w[..., None] * (1.0 - card_face * 0.32)
 
-        # Sweep-ignited background etching grooves
-        bg_etch_glint = etch_w * bg_dark_w * (0.22 + 0.78 * np.clip(sweep_band * 1.25 + spot * 0.55, 0.0, 1.0)) * inten
-        card_face = card_face + (irid_mix * 0.58 + theme.metal_bright[None, None, :] * 0.42) * (bg_etch_glint * 0.34)[..., None]
+        # Sweep-ignited background etching grooves + diagonal laser flare
+        bg_etch_glint = etch_w * bg_dark_w * (0.24 + 0.76 * np.clip(sweep_band * 1.25 + spot * 0.55, 0.0, 1.0)) * inten
+        card_face = card_face + (bg_laser * 0.62 + theme.metal_bright[None, None, :] * 0.38) * (bg_etch_glint * 0.38)[..., None]
 
-        # --- Unified Directional Cast Shadow of Subject onto Deep Background & 流麻 ---
-        sh_dx = -lx * card_w * 0.036 - px * bg_parallax_px * 0.45
-        sh_dy = -ly * card_h * 0.028 - py * bg_parallax_px * 0.45
-        sh_map_x = (base_xx - sh_dx).astype(np.float32)
-        sh_map_y = (base_yy - sh_dy).astype(np.float32)
-        subj_shadow = cv2.remap(subj_alpha, sh_map_x, sh_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
-        subj_shadow = cv2.GaussianBlur(subj_shadow, (0, 0), sigmaX=max(8.0, card_w * 0.022))
+        # --- Depth-Stratified Contact & Floating Cast Shadow onto Deep Background & 流麻 ---
+        # Near-background parts cast tight crisp contact shadows; protruding limbs/hands cast
+        # wider, softer, farther-offset floating shadows driven directly by the depth map!
+        sh_dx = -lx * card_w * 0.042 - px * bg_parallax_px * 0.50
+        sh_dy = -ly * card_h * 0.034 - py * bg_parallax_px * 0.50
+        sh_low = cv2.GaussianBlur(
+            cv2.remap(
+                a_sh_low,
+                base_xx - np.float32(sh_dx * 0.42),
+                base_yy - np.float32(sh_dy * 0.42),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+            ),
+            (0, 0), sigmaX=max(4.0, card_w * 0.011),
+        )
+        sh_mid = cv2.GaussianBlur(
+            cv2.remap(
+                a_sh_mid,
+                base_xx - np.float32(sh_dx * 0.95),
+                base_yy - np.float32(sh_dy * 0.95),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+            ),
+            (0, 0), sigmaX=max(9.0, card_w * 0.023),
+        )
+        sh_high = cv2.GaussianBlur(
+            cv2.remap(
+                a_sh_high,
+                base_xx - np.float32(sh_dx * 1.55),
+                base_yy - np.float32(sh_dy * 1.55),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+            ),
+            (0, 0), sigmaX=max(15.0, card_w * 0.038),
+        )
+        subj_shadow = np.clip(sh_low * 1.05 + sh_mid * 0.92 + sh_high * 0.72, 0.0, 1.0).astype(np.float32)
 
-        # Apply subject cast shadow onto deep background
-        card_face *= (1.0 - subj_shadow[..., None] * 0.52)
+        # Apply depth-stratified subject cast shadow onto deep background
+        card_face *= (1.0 - subj_shadow[..., None] * 0.54)
 
         # --- Interlayer: Background Quicksand (流麻) + 300 3D Normal-Lit Glitters ---
         render_quicksand_layer(
@@ -1125,61 +1323,56 @@ def render_3layer_sar_gif(
         )
 
         # --- Inner 3D Acrylic Diorama Box Wall Refraction & Cavity Shadow ---
-        # Gives unmistakable physical "looking into a deep crystal shadowbox" depth!
         cavity_sdf = cv2.remap(
             sdf,
-            (base_xx - px * bg_parallax_px * 0.70).astype(np.float32),
-            (base_yy - py * bg_parallax_px * 0.70).astype(np.float32),
+            (base_xx - px * bg_parallax_px * 0.78).astype(np.float32),
+            (base_yy - py * bg_parallax_px * 0.78).astype(np.float32),
             cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
         )
-        # Inner wall region visible inside the front glass edge when tilted
         cavity_wall = np.clip((cavity_sdf + 2.0) / max(4.0, card_w * 0.015), 0.0, 1.0) * alpha_mask
         cavity_wall_lit = np.clip(edge_nx * lx + edge_ny * ly, -1.0, 1.0)
-        # Lit inner acrylic wall catches subtle iridescent crystal refraction; shadow wall deepens cavity
-        wall_prism = (theme.metal_bright[None, None, :] * 0.55 + irid_mix * 0.45) * np.clip(cavity_wall_lit * 0.5 + 0.5, 0.0, 1.0)[..., None]
-        card_face = card_face * (1.0 - cavity_wall[..., None] * 0.36) + wall_prism * (cavity_wall[..., None] * 0.24)
-        # Soft interior box shadow cast by the raised outer rim onto the recessed background & 流麻
+        wall_prism = (theme.metal_bright[None, None, :] * 0.48 + bg_laser * 0.52) * np.clip(cavity_wall_lit * 0.5 + 0.5, 0.0, 1.0)[..., None]
+        card_face = card_face * (1.0 - cavity_wall[..., None] * 0.36) + wall_prism * (cavity_wall[..., None] * 0.28)
         rim_cavity_sh = np.clip(1.0 + cavity_sdf / max(10.0, card_w * 0.045), 0.0, 1.0) ** 1.8 * alpha_mask
         card_face *= (1.0 - rim_cavity_sh[..., None] * 0.32)
         card_face = np.clip(card_face, 0.0, 1.0)
 
-        # --- Layer 2: Midground Sculpted 3D Subject (RGB-Snapped Depth + 14-Plane MPI) ---
-        # 1. Dynamic 3D Contact Self-Shadowing + Crevice AO (cleanly in unwarped subject space)
+        # --- Layer 2: Midground Sculpted 3D Subject (Hybrid Depth-Warping + Relief + Local Sidewalls) ---
+        # 1. Dynamic 3D Contact Self-Shadowing + Crevice AO
         self_sh = compute_depth_contact_shadow(
             depth_map, subj_alpha, base_xx, base_yy,
             lx, ly, step_span_px=max(9.0, card_w * 0.032),
         ) * (1.0 - face_protect_full * 0.55)
         ao_term = depth_ao * (1.0 - face_protect_full * 0.60)
 
-        # 2. Sculptural Warm/Cool Hemispheric Half-Lambert 3D Volumetric Shading
-        # Centered strictly around 1.00 on lit faces so blacks stay rich black & midtones never wash out!
+        # 2. Pure Cel-Shaded Smooth-Normal Half-Lambert Volumetric Lighting (crisp darks & luminous skin)
         ndotl_s = np.clip(depth_nx * lx + depth_ny * ly + depth_nz * float(local_light[2]), -1.0, 1.0)
-        half_lambert = 0.5 * ndotl_s + 0.5
-        # Multiplicative studio spotlight modulation (adds lively moving gleam WITHOUT lifting blacks into grey!)
+        half_lambert = np.clip(0.5 * ndotl_s + 0.5, 0.0, 1.0) ** 1.15
         spot_mult = 0.96 + 0.06 * spot
-        lit_factor = np.clip((0.83 + 0.19 * half_lambert - ao_term * 0.11) * spot_mult, 0.78, 1.04)
-        cool_bounce = np.array([0.95, 0.97, 1.02], dtype=np.float32)
-        warm_key = np.array([1.02, 1.005, 0.985], dtype=np.float32)
+        lit_factor = np.clip((0.88 + 0.14 * half_lambert - ao_term * 0.085) * spot_mult, 0.83, 1.04)
+        cool_bounce = np.array([0.965, 0.980, 1.015], dtype=np.float32)
+        warm_key = np.array([1.015, 1.005, 0.990], dtype=np.float32)
         hemi_tint = cool_bounce[None, None, :] * (1.0 - half_lambert[..., None]) + warm_key[None, None, :] * half_lambert[..., None]
         s_shaded = subj_rgb * lit_factor[..., None] * hemi_tint
 
-        # Soft cool-tinted 3D overlap shadow (pops foreground limbs/sleeves over rear hair/wings!)
-        sh_tint = np.array([0.82, 0.85, 0.94], dtype=np.float32)
-        sh_w = np.clip(self_sh * 0.55 + ao_term * 0.25, 0.0, 0.68)[..., None]
+        # Soft cool-tinted 3D overlap shadow (pops foreground limbs/sleeves over rear hair/wings)
+        sh_tint = np.array([0.84, 0.87, 0.95], dtype=np.float32)
+        sh_w = np.clip(self_sh * 0.45 + ao_term * 0.22, 0.0, 0.58)[..., None]
         s_shaded = s_shaded * (1.0 - sh_w) + (s_shaded * sh_tint[None, None, :]) * sh_w
 
-        # Localized tight specular (only on lit surfaces & true metallic ornaments — never milky veil on dark shadows!)
+        # Protect crisp dark ink outlines from specular & Fresnel washout
+        ink_guard = (1.0 - line_mask * 0.65)
         ndoth_s = np.clip(depth_nx * float(local_half[0]) + depth_ny * float(local_half[1]) + depth_nz * float(local_half[2]), 0.0, 1.0)
-        curv_spec = (ndoth_s ** 26.0) * np.clip(depth_map, 0.0, 1.0) * np.clip((subj_lum - 0.22) * 1.4, 0.0, 1.0) * (1.0 - self_sh * 0.8) * 0.038 * inten
-        metal_spec = (ndoth_s ** 22.0) * metal_mask * (0.30 + 0.70 * sweep_sharp) * 0.42 * inten
-        s_shaded = s_shaded + (theme.metal_bright[None, None, :] * 0.74 + irid_mix * 0.26) * (metal_spec + curv_spec)[..., None]
+        curv_spec = (ndoth_s ** 28.0) * np.clip(depth_map, 0.0, 1.0) * np.clip((subj_lum - 0.26) * 1.4, 0.0, 1.0) * (1.0 - self_sh * 0.8) * ink_guard * 0.032 * inten
+        metal_spec = (ndoth_s ** 22.0) * metal_mask * (0.30 + 0.70 * sweep_sharp) * ink_guard * 0.40 * inten
+        s_shaded = s_shaded + (theme.metal_bright[None, None, :] * 0.72 + irid_mix * 0.28) * (metal_spec + curv_spec)[..., None]
 
-        # SAR Linework Metallic Foil Etching (strictly sweep-triggered so resting dark ink stays crisp & rich!)
+        # SAR Linework Metallic Foil Etching (minimal resting floor, crisp dark cel ink preserved)
         if line_etch_scale > 0.01:
             lm = line_mask
             ldot = np.tanh((line_gx * lx + line_gy * ly) * 1.9)
-            g_sh = np.clip(-ldot, 0.0, 1.0) * 0.24 * line_etch_scale * inten
-            g_lit = np.clip(ldot, 0.0, 1.0) * 0.16 * line_etch_scale * inten
+            g_sh = np.clip(-ldot, 0.0, 1.0) * 0.22 * line_etch_scale * inten
+            g_lit = np.clip(ldot, 0.0, 1.0) * 0.14 * line_etch_scale * inten
             s_shaded = s_shaded * (1.0 - g_sh[..., None] * np.clip(lm * 1.2, 0.0, 1.0)[..., None])
 
             sat_irid = np.clip((irid_mix - 0.50) * 1.95 + 0.48, 0.0, 1.0)
@@ -1187,36 +1380,36 @@ def render_3layer_sar_gif(
             foil_hot = np.clip(foil_col * 0.65 + theme.metal_bright[None, None, :] * 0.40, 0.0, 1.0)
             angle_rip = 0.55 + 0.45 * np.sin(phase1 * 1.15 - phase2 * 0.65)
             sw_hit = np.clip((sweep_sharp * 1.25 - 0.12) / 0.88, 0.0, 1.0) ** 1.4
-            lf_a = np.clip(lm * (0.03 + 0.48 * sw_hit * angle_rip) * line_etch_scale * inten, 0.0, 0.56)
+            lf_a = np.clip(lm * (0.015 + 0.42 * sw_hit * angle_rip) * line_etch_scale * inten, 0.0, 0.44)
             s_shaded = s_shaded * (1.0 - lf_a[..., None]) + foil_col * lf_a[..., None]
-            s_shaded = s_shaded + foil_hot * (g_lit * sw_hit + (sweep_sharp ** 2.4) * lm * 0.26 * line_etch_scale * inten)[..., None] * (0.35 + 0.65 * lm[..., None])
+            s_shaded = s_shaded + foil_hot * (g_lit * sw_hit + (sweep_sharp ** 2.4) * lm * 0.22 * line_etch_scale * inten)[..., None] * (0.35 + 0.65 * lm[..., None])
 
-        # Tight 3D View-Dependent Fresnel Rim Light strictly along grazing silhouette edges
+        # Tight 3D View-Dependent Fresnel Rim Light along grazing silhouette edges
         ndotv_s = np.clip(depth_nx * float(local_view[0]) + depth_ny * float(local_view[1]) + depth_nz * float(local_view[2]), 0.0, 1.0)
         fresnel_3d = np.clip(1.0 - ndotv_s, 0.0, 1.0) ** 4.0
-        rim_w = np.clip(fresnel_edge_base * 0.48 + fresnel_3d * 0.24, 0.0, 0.65) * subj_alpha * (0.45 + 0.55 * sweep_band) * inten
-        s_shaded = s_shaded + (irid_mix * 0.52 + theme.metal_bright[None, None, :] * 0.48) * (rim_w * 0.18)[..., None]
+        rim_w = np.clip(fresnel_edge_base * 0.45 + fresnel_3d * 0.22, 0.0, 0.62) * subj_alpha * ink_guard * (0.45 + 0.55 * sweep_band) * inten
+        s_shaded = s_shaded + (irid_mix * 0.50 + theme.metal_bright[None, None, :] * 0.50) * (rim_w * 0.17)[..., None]
 
-        # Preserve crisp luminous highlights without squashing top 12% into flat grey
-        s_shaded = np.where(s_shaded > 0.94, 0.94 + 0.06 * np.tanh((s_shaded - 0.94) / 0.14), s_shaded)
-        s_shaded = np.clip(s_shaded, 0.0, 1.0)
+        # C^1 soft-knee highlight roll-off (pure cel brightness + silky highlight transition)
+        s_shaded = apply_highlight_rolloff(s_shaded, knee=0.92, spread=0.08)
 
-        # 3. Warp & Composite via Occlusion-Aware 14-Plane Premultiplied MPI!
+        # 3. Hybrid Depth-Warping + Relief Mapping + Self-Occlusion + Local Sidewalls + Disocclusion Completion
         s_rgb, s_a = render_mpi_subject(
             s_shaded, subj_alpha, mpi_planes, px, py, relief_px, base_xx, base_yy,
             is_opaque_full=is_opaque_full,
+            z_pivot=z_pivot,
         )
         s_a = (s_a * alpha_mask).astype(np.float32)
 
         # Composite midground 3D subject cleanly over background + 流麻 interlayer
         card_face = card_face * (1.0 - s_a[..., None]) + s_rgb * s_a[..., None]
 
-        # --- Layer 3: Raised Foreground Ornate Decorative Frame (Double-Layer Emboss + DoF) ---
+        # --- Layer 3: Raised Foreground Ornate Decorative Frame (Premultiplied Alpha DoF + Laser Foil) ---
         if has_fg:
             fg_map_x = (base_xx + px * fg_parallax_px).astype(np.float32)
             fg_map_y = (base_yy + py * fg_parallax_px).astype(np.float32)
 
-            # Soft subtle local shadow cast by foreground frame onto subject (never dirties colors!)
+            # Soft subtle local shadow cast by foreground frame onto subject
             fg_sh_x = (fg_map_x - lx * card_w * 0.010).astype(np.float32)
             fg_sh_y = (fg_map_y - ly * card_h * 0.008).astype(np.float32)
             fg_shadow = cv2.remap(fg_alpha, fg_sh_x, fg_sh_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
@@ -1233,32 +1426,35 @@ def render_3layer_sar_gif(
             under_col = theme.metal_shadow * 0.82
             card_face = card_face * (1.0 - fg_under_a[..., None] * 0.78) + under_col[None, None, :] * (fg_under_a[..., None] * 0.78)
 
-            # Raised top foreground metallic layer (with Premultiplied Alpha DoF!)
-            fg_w_rgb = cv2.remap(fg_rgb_dof, fg_map_x, fg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0))
-            fg_w_a = cv2.remap(fg_alpha_dof, fg_map_x, fg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+            # Raised top foreground metallic layer via Premultiplied Alpha warp (zero dark rim!)
+            fg_w_premul = cv2.remap(fg_premul_dof, fg_map_x, fg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0))
+            fg_w_a = np.clip(cv2.remap(fg_alpha_dof, fg_map_x, fg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0), 0.0, 1.0)
+            fg_w_rgb = np.where(
+                fg_w_a[..., None] > 1e-4,
+                np.clip(fg_w_premul / np.maximum(fg_w_a[..., None], 1e-4), 0.0, 1.0),
+                0.0,
+            ).astype(np.float32)
             fg_w_gx = cv2.remap(fg_gx, fg_map_x, fg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
             fg_w_gy = cv2.remap(fg_gy, fg_map_x, fg_map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
 
-            # High-intensity angle-driven gilded/silver/violet-gold reflection on foreground ornament
+            # High-intensity angle-driven gilded/holographic laser reflection on foreground ornament
             fg_emb = np.tanh((fg_w_gx * lx + fg_w_gy * ly) * 1.4) * 0.24
             fg_foil_shimmer = (0.35 + 0.65 * np.clip(sweep_band * 1.30 + spot * 0.55, 0.0, 1.0)) * inten
             fg_lit = (
                 fg_w_rgb * (0.85 + 0.25 * angle_boost)
-                + (theme.metal_bright[None, None, :] * 0.65 + irid_mix * 0.35) * (fg_foil_shimmer * 0.55)[..., None]
+                + (theme.metal_bright[None, None, :] * 0.55 + bg_laser * 0.45) * (fg_foil_shimmer * 0.56)[..., None]
                 + np.where(fg_emb[..., None] >= 0, theme.metal_bright[None, None, :], theme.metal_shadow[None, None, :]) * np.abs(fg_emb)[..., None]
             )
             fg_lit = np.clip(fg_lit, 0.0, 1.0)
             card_face = card_face * (1.0 - fg_w_a[..., None]) + fg_lit * fg_w_a[..., None]
 
-        # --- Full-Card Crisp Diagonal Glass Specular Sheen (zero milky veil over subject!) ---
-        # Narrow, clean diagonal laminated sheen strongest on background/frame, subtle & crisp across subject
+        # --- Full-Card Crisp Diagonal Glass Laser Sheen (zero milky veil over subject!) ---
         s_lum = (0.299 * s_rgb[..., 0] + 0.587 * s_rgb[..., 1] + 0.114 * s_rgb[..., 2]).astype(np.float32)
         bright_cloth_protect = s_a * np.clip((s_lum - 0.65) / 0.32, 0.0, 0.88)
-        subj_glass_scale = (1.0 - s_a * 0.58)
+        subj_glass_scale = (1.0 - s_a * 0.60)
         glass_atten = np.clip((1.0 - face_protect_full * 0.82) * (1.0 - bright_cloth_protect) * subj_glass_scale, 0.04, 1.0)
-        sweep_col = theme.metal_bright * 0.55 + np.array([1.0, 1.0, 1.0], dtype=np.float32) * 0.45
-        card_face = card_face + sweep_col[None, None, :] * (sweep_sharp * glass_atten * 0.11 * inten)[..., None]
-        # Background-only subtle studio spotlight glow (never adds white haze onto the character!)
+        sweep_col = theme.metal_bright[None, None, :] * 0.50 + np.array([1.0, 1.0, 1.0], dtype=np.float32)[None, None, :] * 0.35 + laser_prism * 0.15
+        card_face = card_face + sweep_col * (sweep_sharp * glass_atten * 0.11 * inten)[..., None]
         bg_only_spot = (1.0 - s_a) * spot * 0.040 * inten
         card_face = card_face + (theme.metal_bright * 0.50 + 0.50)[None, None, :] * bg_only_spot[..., None]
 
@@ -1268,12 +1464,11 @@ def render_3layer_sar_gif(
         rim_col = theme.metal_shadow[None, None, :] * (1.0 - rim_spec[..., None]) + theme.metal_bright[None, None, :] * rim_spec[..., None]
         card_face = card_face * (1.0 - bevel_mask[..., None] * 0.90) + rim_col * (bevel_mask[..., None] * 0.90)
 
-        # Global soft highlight roll-off (preserves deep contrast and crisp bright speculars)
-        card_face = np.where(card_face > 0.94, 0.94 + 0.06 * np.tanh((card_face - 0.94) / 0.16), card_face)
-        card_face = np.clip(card_face, 0.0, 1.0).astype(np.float32)
+        # Global C^1 soft-knee highlight roll-off (preserves deep darks & silky speculars)
+        card_face = apply_highlight_rolloff(card_face, knee=0.92, spread=0.08)
 
         # ===================================================================
-        # STUDIO SCENE: Background, Shadow, 8-Layer Thickness, 3D Warp, Glints
+        # STUDIO SCENE: OpenCV 3D Warp + Pillow RGBA Compositing & Lanczos
         # ===================================================================
         canvas = render_studio_background(
             ss_canvas_h, ss_canvas_w, theta, float_y, rx, ry, theme, base_studio_bg=base_studio_bg
@@ -1294,25 +1489,43 @@ def render_3layer_sar_gif(
         )
         blur_sigma = (22.0 + 10.0 * float_norm) * supersample
         shadow_soft = cv2.GaussianBlur(shadow_sil, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
-        canvas *= (1.0 - shadow_soft[..., None] * (0.58 - 0.14 * float_norm))
+        shadow_alpha_map = np.clip(shadow_soft * (0.58 - 0.14 * float_norm), 0.0, 1.0).astype(np.float32)
 
-        # 8-layer brushed metallic thickness slices (back-to-front)
+        # 8-layer brushed metallic thickness slices (Premultiplied-Alpha packed 4-ch warp, in-place)
+        edge_base_rgba = np.empty((card_h, card_w, 4), dtype=np.float32)
+        edge_base_rgba[..., :3] = (
+            shade_metallic_edge_slice(R, theta, card_edge_data, brushed_tex, theme, 1.0)
+            * alpha_mask[..., None]
+        )
+        edge_base_rgba[..., 3] = alpha_mask
+        edge_premul = np.zeros((ss_canvas_h, ss_canvas_w, 3), dtype=np.float32)
+        edge_a = np.zeros((ss_canvas_h, ss_canvas_w), dtype=np.float32)
+        inv_buf = np.empty((ss_canvas_h, ss_canvas_w), dtype=np.float32)
+        one32 = np.float32(1.0)
         for k in range(thickness_layers, 0, -1):
             z_loc = thickness_total * (k / float(thickness_layers))
             slice_t = 1.0 - (k / float(thickness_layers))
-            edge_rgb = shade_metallic_edge_slice(R, theta, card_edge_data, brushed_tex, theme, slice_t)
             H_slice = plane_homography_for_z(card_w, card_h, R, z_loc, float_y, focal, canvas_cx, canvas_cy)
-            w_rgb = cv2.warpPerspective(edge_rgb, H_slice, (ss_canvas_w, ss_canvas_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0))
-            w_a = cv2.warpPerspective(alpha_mask, H_slice, (ss_canvas_w, ss_canvas_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)[..., None]
-            canvas = canvas * (1.0 - w_a) + w_rgb * w_a
+            w_rgba = cv2.warpPerspective(
+                edge_base_rgba, H_slice, (ss_canvas_w, ss_canvas_h),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0, 0.0),
+            )
+            w_a = np.clip(w_rgba[..., 3], 0.0, 1.0)
+            np.subtract(one32, w_a, out=inv_buf)
+            edge_premul *= inv_buf[..., None]
+            w_rgba[..., :3] *= np.float32(0.72 + 0.28 * slice_t)
+            edge_premul += w_rgba[..., :3]
+            edge_a *= inv_buf
+            edge_a += w_a
 
-        # Front 3-layer composited card window
+        # Front 3-layer composited card window via Premultiplied-Alpha warp -> Pillow RGBA
         H_front = plane_homography_for_z(card_w, card_h, R, 0.0, float_y, focal, canvas_cx, canvas_cy)
-        w_face = cv2.warpPerspective(card_face, H_front, (ss_canvas_w, ss_canvas_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0))
-        w_face_a = cv2.warpPerspective(alpha_mask, H_front, (ss_canvas_w, ss_canvas_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)[..., None]
-        canvas = canvas * (1.0 - w_face_a) + w_face * w_face_a
+        face_pil_rgba = warp_premultiplied_to_pil_rgba(
+            card_face, alpha_mask, H_front, ss_canvas_w, ss_canvas_h
+        )
 
-        # Anchored 4-point cross star glints synced to diagonal sweep
+        # Anchored 4-point cross star glints & foreground particles into additive pass
+        fx_add = np.zeros((ss_canvas_h, ss_canvas_w, 3), dtype=np.float32)
         for ax, ay, size_scale in anchors:
             u_a = ax / max(1, card_w - 1)
             v_a = ay / max(1, card_h - 1)
@@ -1322,14 +1535,14 @@ def render_3layer_sar_gif(
             pt = H_front @ np.array([ax, ay, 1.0], dtype=np.float64)
             gx, gy = float(pt[0] / pt[2]), float(pt[1] / pt[2])
             glint_rad = (15.0 + 20.0 * peak) * size_scale * (ss_canvas_w / 920.0)
-            draw_star_glint(canvas, gx, gy, glint_rad, glint_int, theme.metal_bright)
+            draw_star_glint(fx_add, gx, gy, glint_rad, glint_int, theme.metal_bright)
 
-        # Foreground parallax soft-focus particles
-        render_particles(canvas, fg_particles, theta)
+        render_particles(fx_add, fg_particles, theta)
 
-        # Downsample cleanly with Lanczos
-        ss_u8 = np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        pil_final = Image.fromarray(ss_u8, mode="RGB").resize((final_width, final_h), Image.Resampling.LANCZOS)
+        # Pillow RGBA compositing + Lanczos downsample
+        pil_final = compose_studio_frame_pillow(
+            canvas, shadow_alpha_map, edge_premul, edge_a, face_pil_rgba, fx_add, final_width, final_h
+        )
         if single_frame_theta is not None:
             return {
                 "preview_image": pil_final,
@@ -1348,7 +1561,7 @@ def render_3layer_sar_gif(
     if cancel_event is not None and cancel_event.is_set():
         raise RenderCancelledError("渲染已取消")
 
-    _report(n_frames + 1, total_steps, "正在构建共享 256 色 Median Cut 调色板并导出 GIF...")
+    _report(n_frames + 1, total_steps, "正在构建共享 256 色三子调色板 (Floyd-Steinberg 抖动) 并导出 GIF...")
     adj_diffs = [
         float(np.mean(np.abs(frames_final[i + 1].astype(np.float32) - frames_final[i].astype(np.float32))))
         for i in range(n_frames - 1)
@@ -1394,9 +1607,9 @@ def render_live_preview_frame(
     """Fast single-frame WYSIWYG 3D preview renderer for GUI interactive previews."""
     theta_map = {
         "front": 0.0,
-        "right": math.pi * 0.5,      # +17.5 deg Y-axis tilt
-        "left": math.pi * 1.5,       # -17.5 deg Y-axis tilt
-        "diag": math.pi * 0.25,      # +12.4 deg Y & +10.5 deg X
+        "right": math.pi * 0.5,      # +19.5 deg Y-axis tilt
+        "left": math.pi * 1.5,       # -19.5 deg Y-axis tilt
+        "diag": math.pi * 0.25,      # +13.8 deg Y & +11.5 deg X
         "tilt": math.pi * 0.25,      # alias used by Tauri UI
     }
     theta = theta_map.get(angle_preset, math.pi * 0.5)
@@ -1431,6 +1644,8 @@ def main() -> None:
     parser.add_argument("--line-etch", default="medium", choices=["off", "subtle", "medium", "strong"])
     parser.add_argument("--depth-engine", default="auto", choices=["fast", "ai", "ai_large", "auto"],
                         help="2D->Depth generator when --depth is omitted: auto | ai_large | ai | fast")
+    parser.add_argument("--invert-depth", action="store_true", help="Invert depth map (use for black=near / white=far maps)")
+    parser.add_argument("--depth-gamma", type=float, default=1.0, help="Depth curve gamma shaping (0.35 to 2.5)")
     parser.add_argument("--quicksand", type=float, default=1.0, help="Quicksand (流麻) intensity (0.0 to 1.6)")
     parser.add_argument("--relief", type=float, default=1.0, help="3D Relief Mapping parallax strength (0.0 to 1.6)")
     parser.add_argument("--subject-scale", type=float, default=1.0, help="Midground subject zoom scale (0.4 to 1.8)")
@@ -1460,6 +1675,8 @@ def main() -> None:
         bg_mode=args.bg_mode,
         line_etch=args.line_etch,
         depth_engine=args.depth_engine,
+        invert_depth=args.invert_depth,
+        depth_gamma=args.depth_gamma,
         quicksand_strength=args.quicksand,
         relief_strength=args.relief,
         subject_scale=args.subject_scale,

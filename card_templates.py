@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from depth_estimator import _guided_filter_gray, estimate_depth_fast
+from depth_estimator import _guided_filter_color, _guided_filter_gray, estimate_depth_fast
 
 
 # ---------------------------------------------------------------------------
@@ -1002,19 +1002,22 @@ def align_and_refine_depth_map(
     subject_alpha: np.ndarray,
     use_ecc: bool = True,
     guide_rgb: Optional[np.ndarray] = None,
+    align_only: bool = False,
+    invert_depth: bool = False,
+    depth_gamma: float = 1.0,
 ) -> np.ndarray:
     """
-    Precision depth-to-artwork fusion:
-      1. Smart IoU-gated ECC Affine Alignment: only warps externally supplied
-         depth maps when their silhouette actually diverges (IoU < 0.92), never
-         drifting an already pixel-aligned AI depth map.
-      2. Interior-only nearest-neighbor hole fill: repairs dark interior parts
-         (horns/hair tips) strictly inside `subject_alpha`, NEVER creating an
-         invisible outer dilation skirt outside the silhouette.
-      3. RGB-Guided edge-snapping filter (`_guided_filter_gray`) guided by the
-         artwork itself so depth jumps lock pixel-accurately onto real drawn
-         contours (hands, sleeves, dress folds, wings, hair) with zero bleeding.
-    Returns clean smooth height field H in [0, 1] (0 outside subject silhouette).
+    Precision monocular depth-to-artwork fusion:
+      1. Optional depth inversion (`invert_depth=True` for black=near Z-pass maps)
+         plus Smart IoU-gated ECC Affine Alignment for external misaligned depth maps.
+      2. Interior-only nearest-neighbor hole fill strictly inside `subject_alpha`.
+         When `align_only=True`, returns the geometrically aligned raw depth without
+         filtering so callers can warp once and smooth ONCE at final card resolution.
+      3. 3-channel CIE Lab Color Guided Filter (`_guided_filter_color`) locking depth
+         jumps onto BOTH luminance and isoluminant hue/chroma cel contours.
+      4. Edge-preserving smooth heightfield + outer silhouette rim depth lock +
+         internal cliff flying-pixel snap.
+    Returns clean smooth height field H in [0.06, 1.0] inside silhouette (0 outside).
     """
     h, w = subject_alpha.shape[:2]
     d = cv2.resize(raw_depth_gray.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
@@ -1024,9 +1027,17 @@ def align_and_refine_depth_map(
     else:
         return np.zeros((h, w), dtype=np.float32)
 
-    valid_fg = subject_alpha > 0.12
+    valid_fg = subject_alpha > 0.04
     if not np.any(valid_fg):
         return np.zeros((h, w), dtype=np.float32)
+
+    # Handle white-background Z-pass inversion before ECC if border is bright
+    inverted_early = False
+    if invert_depth:
+        border_vals = np.concatenate([d[0, :], d[-1, :], d[:, 0], d[:, -1]])
+        if float(np.median(border_vals)) > 0.80 or float(np.mean(valid_fg)) >= 0.96:
+            d = 1.0 - d
+            inverted_early = True
 
     # 1. Smart IoU-gated ECC alignment (only for misaligned external depth maps)
     if use_ecc and float(np.mean(valid_fg)) < 0.96:
@@ -1075,38 +1086,48 @@ def align_and_refine_depth_map(
         valid_coords = np.argwhere(has_depth)
         idx = np.clip(labels - 1, 0, len(valid_coords) - 1)
         d_nearest = d[valid_coords[idx, 0], valid_coords[idx, 1]]
-        # Keep extrapolated values everywhere temporarily solely so the guided/bilateral
-        # filter doesn't bleed zero background depth inward across silhouette edges!
         d_for_filter = np.where(has_depth, d, d_nearest).astype(np.float32)
     else:
         d_for_filter = d.copy()
 
-    # 3. RGB-Guided edge-snapping filter: locks blurry AI depth edges onto drawn contours,
-    #    while preserving ultra-crisp edges already present in 16-bit/studio depth maps!
+    # Invert foreground depth values cleanly if dark-near cutout map requested inversion
+    if invert_depth and not inverted_early:
+        fg_v = d_for_filter[valid_fg]
+        lo_i, hi_i = float(fg_v.min()), float(fg_v.max())
+        if hi_i > lo_i + 1e-5:
+            d_for_filter = np.clip(1.0 - (d_for_filter - lo_i) / (hi_i - lo_i), 0.0, 1.0).astype(np.float32)
+
+    if align_only:
+        return np.where(valid_fg, np.clip(d_for_filter, 0.02, 1.0), 0.0).astype(np.float32)
+
+    # 3. 3-Channel CIE Lab Color Guided Filter + smooth edge-preserving heightfield:
+    #    locks blurry AI depth onto luminance AND isoluminant hue/chroma cel contours
+    #    while preserving crisp native 16-bit/studio boundaries.
+    dgx = cv2.Sobel(d_for_filter, cv2.CV_32F, 1, 0, ksize=3)
+    dgy = cv2.Sobel(d_for_filter, cv2.CV_32F, 0, 1, ksize=3)
+    d_grad = np.sqrt(dgx * dgx + dgy * dgy)
+
     if guide_rgb is not None and guide_rgb.shape[:2] == (h, w):
-        guide_l = (
-            0.299 * guide_rgb[..., 0] + 0.587 * guide_rgb[..., 1] + 0.114 * guide_rgb[..., 2]
-        ).astype(np.float32)
-        # Extrapolate guide_l outward cleanly so silhouette boundary stays razor sharp
+        guide_ext = guide_rgb.astype(np.float32)
         if np.any(valid_fg) and not np.all(valid_fg):
             inv_fg = (~valid_fg).astype(np.uint8)
             _, lbl_g = cv2.distanceTransformWithLabels(inv_fg, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
             fg_coords = np.argwhere(valid_fg)
             g_idx = np.clip(lbl_g - 1, 0, len(fg_coords) - 1)
-            guide_l = np.where(valid_fg, guide_l, guide_l[fg_coords[g_idx, 0], fg_coords[g_idx, 1]])
+            guide_ext = np.where(valid_fg[..., None], guide_ext, guide_ext[fg_coords[g_idx, 0], fg_coords[g_idx, 1]])
         rad = max(3, int(round(w * 0.009)))
-        d_snapped = _guided_filter_gray(guide_l, d_for_filter, radius=rad, eps=0.0025)
-        # Preserve crisp native depth boundaries (e.g., white-on-white fingers/lace in 16-bit depth!)
-        dgx = cv2.Sobel(d_for_filter, cv2.CV_32F, 1, 0, ksize=3)
-        dgy = cv2.Sobel(d_for_filter, cv2.CV_32F, 0, 1, ksize=3)
-        d_grad = np.sqrt(dgx * dgx + dgy * dgy)
+        d_snapped = _guided_filter_color(guide_ext, d_for_filter, radius=rad, eps=0.0022)
         preserve_sharp = np.clip((d_grad - 0.04) * 5.0, 0.0, 0.80)
         d_mixed = d_snapped * (1.0 - preserve_sharp) + d_for_filter * preserve_sharp
-        d_smooth = cv2.bilateralFilter(d_mixed, d=5, sigmaColor=0.08, sigmaSpace=max(3.0, w * 0.007))
+        d_bilat = cv2.bilateralFilter(d_mixed, d=7, sigmaColor=0.09, sigmaSpace=max(4.5, w * 0.010))
     else:
-        d_smooth = cv2.bilateralFilter(d_for_filter, d=5, sigmaColor=0.08, sigmaSpace=max(3.0, w * 0.007))
+        d_bilat = cv2.bilateralFilter(d_for_filter, d=7, sigmaColor=0.09, sigmaSpace=max(4.5, w * 0.010))
 
-    # 4. Clean foreground dynamic-range normalization (faithful to AI depth, zero pillow bloat!)
+    d_low = cv2.GaussianBlur(d_bilat, (0, 0), sigmaX=max(2.0, w * 0.005))
+    flat_w = np.clip(1.0 - d_grad * 12.0, 0.0, 0.65).astype(np.float32)
+    d_smooth = (d_bilat * (1.0 - flat_w) + d_low * flat_w).astype(np.float32)
+
+    # 4. Clean foreground dynamic-range normalization + optional gamma shaping
     fg_vals = d_smooth[valid_fg]
     p_lo, p_hi = float(np.percentile(fg_vals, 2.0)), float(np.percentile(fg_vals, 98.5))
     if p_hi > p_lo + 1e-4:
@@ -1114,6 +1135,37 @@ def align_and_refine_depth_map(
     else:
         d_norm = np.full((h, w), 0.5, dtype=np.float32)
 
+    if abs(depth_gamma - 1.0) > 1e-3:
+        d_norm = np.power(d_norm, np.float32(max(0.35, min(2.5, depth_gamma)))).astype(np.float32)
+
     # Map strictly inside valid silhouette to [0.06, 1.0], and strictly 0.0 outside!
     d_out = np.where(valid_fg, 0.06 + 0.94 * d_norm, 0.0).astype(np.float32)
-    return np.clip(d_out, 0.0, 1.0).astype(np.float32)
+
+    # 5. Outer silhouette rim depth lock: keep outer anti-aliased ink glued to body depth
+    if not np.all(valid_fg):
+        dist_bg = cv2.distanceTransform(valid_fg.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+        solid_core = valid_fg & (dist_bg > 3.5)
+        if np.any(solid_core):
+            inv_core = (~solid_core).astype(np.uint8)
+            dist_c, lbl_c = cv2.distanceTransformWithLabels(inv_core, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+            c_coords = np.argwhere(solid_core)
+            c_idx = np.clip(lbl_c - 1, 0, len(c_coords) - 1)
+            d_from_core = d_out[c_coords[c_idx, 0], c_coords[c_idx, 1]]
+            rim_zone = valid_fg & (dist_bg <= 4.5) & (dist_c <= 6.5)
+            d_out = np.where(rim_zone, np.maximum(d_out, d_from_core), d_out).astype(np.float32)
+
+    # 6. Internal depth-cliff flying-pixel snap: eliminate mid-air boundary ink pixels along jumps
+    if guide_rgb is not None and guide_rgb.shape[:2] == (h, w):
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        d_hi = cv2.dilate(d_out, k5)
+        d_lo = cv2.erode(np.where(valid_fg, d_out, 1.0).astype(np.float32), k5)
+        cgx = cv2.Sobel(d_out, cv2.CV_32F, 1, 0, ksize=3)
+        cgy = cv2.Sobel(d_out, cv2.CV_32F, 0, 1, ksize=3)
+        cgmag = np.sqrt(cgx * cgx + cgy * cgy)
+        cliff_jump = valid_fg & ((d_hi - d_lo) > 0.14) & (cgmag > 0.08)
+        if np.any(cliff_jump):
+            g_lum = (0.299 * guide_rgb[..., 0] + 0.587 * guide_rgb[..., 1] + 0.114 * guide_rgb[..., 2]).astype(np.float32)
+            snap_to_hi = (g_lum < 0.50) | ((d_hi - d_out) <= (d_out - d_lo))
+            d_out = np.where(cliff_jump, np.where(snap_to_hi, d_hi, d_lo), d_out).astype(np.float32)
+
+    return np.where(valid_fg, np.clip(d_out, 0.06, 1.0), 0.0).astype(np.float32)
