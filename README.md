@@ -1,6 +1,6 @@
 # 3D 全息浮雕塔罗 & SAR 流麻闪卡工作室 (Tarot Holographic Studio)
 
-基于 **Tauri v2 + Python (OpenCV / NumPy / Pillow / Depth-Anything-V2 ONNX & CUDA)** 打造的 3D 全息悬浮塔罗 / 宝可梦 SAR 流麻闪卡桌面生成器。
+基于 **Tauri v2 + Python (OpenCV / NumPy / Pillow / Depth-Anything-V2 ONNX & CUDA)** 打造的 3D 全息悬浮塔罗 / 宝可梦 SAR 流麻闪卡桌面生成器。感谢 X 上的 @yygqdkqk 和 @aiiii498 的提示词。
 
 ## 核心特性
 
@@ -82,23 +82,3 @@ python render_sar_card.py \
 
 ### v1.0.0
 - 首个公开版本：Tauri v2 暗黑鎏金桌面工作室、3 层 SAR 流麻引擎、28 套前/后/卡外模板、12×3 视觉配置墙与 ONNX 轻量便携版。
-
----
-
-## 目录结构
-
-```text
-.
-├── backend_server.py            # Tauri 本地静默 HTTP API 后端（纯标准库）
-├── render_sar_card.py           # 旗舰 3 层 SAR + 流麻 + 14 层 MPI 3D 渲染管线
-├── render_tarot_holographic.py  # 经典单层全息浮雕 + 光栅/金属/画幅/调色板核心库
-├── card_templates.py            # 模板程序化生成器 + 16位深度加载与 RGB 引导对齐
-├── depth_estimator.py           # ONNX Runtime / PyTorch CUDA (Small & Large) / 导向滤波深度引擎
-├── export_depth_onnx.py         # Depth-Anything-V2-Small -> 单文件 ONNX 无损导出脚本
-├── tarot_gui.py / tarot_gui.pyw # 备用 Tkinter 可视化桌面端
-├── requirements.txt
-└── tauri-app/                   # Tauri v2 原生桌面壳（Rust + 暗黑鎏金 Web UI）
-    ├── package.json
-    ├── src/                     # index.html / styles.css / main.js
-    └── src-tauri/               # Cargo.toml / tauri.conf.json / src/main.rs / icons/
-```
