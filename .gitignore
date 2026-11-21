@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tauri / Node / Rust build artifacts
+tauri-app/node_modules/
+tauri-app/src-tauri/target/
+tauri-app/src-tauri/gen/
+
+# Packaging, large binaries & models (distributed via GitHub Releases)
+dist/
+build/
+build_portable/
+models/*.onnx
+models/*.safetensors
+models/*.bin
+*.exe
+*.zip
+*.msi
+*.spec
+
+# Auto-generated templates & rendered demo GIFs
+templates/
+*.gif
+
+# Unrelated workspace files
+/index.html
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

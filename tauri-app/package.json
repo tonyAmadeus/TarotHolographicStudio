@@ -1,0 +1,18 @@
+{
+  "name": "tarot-holographic-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tauri v2 desktop studio for 3D Holographic Tarot & SAR Quicksand Cards",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:exe": "tauri build --no-bundle"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.2.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0"
+  }
+}

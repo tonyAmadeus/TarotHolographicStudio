@@ -1,0 +1,10 @@
+# Core rendering engine (required)
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
+pillow>=10.0.0
+
+# Lightweight CPU AI monocular depth (recommended for ONNX model)
+onnxruntime>=1.19.0
+
+# Optional: GPU AI depth (Depth-Anything-V2-Small / Large) & ONNX export
+# pip install torch torchvision transformers onnx onnxscript

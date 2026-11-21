@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>3D 全息浮雕塔罗 &amp; SAR 流麻闪卡工作室</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- Subtle startup overlay while local Python engine initializes -->
+  <div id="boot-overlay" class="boot-overlay" aria-live="polite">
+    <div class="boot-card">
+      <div class="boot-emblem" aria-hidden="true">✦</div>
+      <h1 class="boot-title">3D 全息塔罗 &amp; SAR 流麻工作室</h1>
+      <p id="boot-status" class="boot-status">正在静默连接本地 Python 3D 渲染与 AI 深度引擎…</p>
+    </div>
+  </div>
+
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-star" aria-hidden="true">✦</span>
+        <div>
+          <h1 class="brand-title">3D 全息浮雕塔罗 &amp; SAR 流麻闪卡工作室</h1>
+          <p class="brand-sub">3-Layer Parallax Window · 16-Step Relief Mapping · Local GPU Depth · 22fps Shared-Palette GIF</p>
+        </div>
+      </div>
+
+      <div class="header-badges">
+        <span id="badge-engine" class="status-pill" title="当前深度引擎状态">引擎检测中…</span>
+        <button id="btn-open-templates" class="btn btn-ghost btn-sm" type="button">打开模板目录</button>
+      </div>
+    </header>
+
+    <!-- Main 2-Column Workspace -->
+    <main class="workspace">
+      <!-- Left Column: Controls & Visual Galleries -->
+      <section class="controls-pane" aria-label="参数与模板配置">
+        <nav class="tab-bar" role="tablist" aria-label="配置分区">
+          <button class="tab-btn is-active" role="tab" aria-selected="true" data-tab="tab-assets" type="button">
+            1. 素材与导出
+          </button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-gallery" type="button">
+            2. 视觉模板库
+          </button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-tuning" type="button">
+            3. 质感与 3D 参数
+          </button>
+        </nav>
+
+        <div class="panel-scroll">
+          <!-- TAB 1: Assets, Mode & Export -->
+          <div id="tab-assets" class="tab-panel is-active" role="tabpanel">
+            <div class="section-card">
+              <div class="section-head">
+                <h2>渲染管线模式</h2>
+                <span class="hint">推荐 3 层 SAR 流麻旗舰模式</span>
+              </div>
+              <div class="mode-grid">
+                <label class="mode-option">
+                  <input type="radio" name="render_mode" value="3layer_sar" checked />
+                  <span class="mode-card">
+                    <strong>三层 SAR 流麻旗舰版</strong>
+                    <small>3D 视差窗口 · AI 深度 Relief · 300 颗流麻细闪 · 景深</small>
+                  </span>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="render_mode" value="classic" />
+                  <span class="mode-card">
+                    <strong>经典单层全息浮雕卡</strong>
+                    <small>单图直出 · 智能抠底 · SAR 微蚀刻与斜向扫光</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>中景主体原图（支持直接拖拽图片）</h2>
+                <span class="hint">透明 PNG 或单色背景均可</span>
+              </div>
+
+              <div id="dropzone-subject" class="dropzone" tabindex="0">
+                <div class="dropzone-icon" aria-hidden="true">❖</div>
+                <div class="dropzone-copy">
+                  <strong id="subject-filename">点击选择或拖拽人物 / 塔罗主体图片到此处</strong>
+                  <small id="subject-path-hint">支持 PNG / JPG / WebP · 留空时右侧自动展示默认 3D 示例卡</small>
+                </div>
+                <div class="dropzone-actions">
+                  <button id="btn-pick-subject" class="btn btn-gold btn-sm" type="button">浏览图片</button>
+                  <button id="btn-clear-subject" class="btn btn-ghost btn-sm" type="button">清空</button>
+                </div>
+                <input id="fallback-file-subject" type="file" accept="image/*" hidden />
+              </div>
+
+              <div class="field-row">
+                <label class="field-label" for="select-bg-mode">抠图模式</label>
+                <select id="select-bg-mode" class="select-input">
+                  <option value="auto">自动识别透明/白底</option>
+                  <option value="keep">保留原图全部画面（不抠图）</option>
+                  <option value="remove">强制边缘洪水抠除单色底</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>中景单目深度图（驱动 3D 凹凸立绘）</h2>
+                <span class="hint">可自动生成或手动指定灰度图</span>
+              </div>
+
+              <div class="path-picker">
+                <input id="input-depth-path" class="text-input" type="text" placeholder="留空则在导出/点击生成时自动计算单目深度图" />
+                <button id="btn-pick-depth" class="btn btn-ghost btn-sm" type="button">浏览</button>
+                <button id="btn-clear-depth" class="btn btn-ghost btn-sm" type="button">清除</button>
+              </div>
+
+              <div class="field-row-split">
+                <div class="field-group">
+                  <label class="field-label" for="select-depth-engine">深度生成引擎</label>
+                  <select id="select-depth-engine" class="select-input">
+                    <option value="auto">自动优先 AI 单目深度（本机自动启用 Large）</option>
+                    <option value="ai_large">Depth-Anything-V2-Large（本机旗舰高精度 GPU）</option>
+                    <option value="ai">Depth-Anything-V2-Small（高速轻量 AI）</option>
+                    <option value="fast">极速离线导向滤波算法</option>
+                  </select>
+                </div>
+                <button id="btn-gen-depth" class="btn btn-gold" type="button">一键生成并预览深度图</button>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>自定义覆盖图层（可选）</h2>
+                <span class="hint">留空时使用「视觉模板库」中所选模板</span>
+              </div>
+
+              <div class="optional-paths">
+                <div class="path-row">
+                  <label class="path-label" for="input-studio-path">卡外背景图</label>
+                  <input id="input-studio-path" class="text-input" type="text" placeholder="留空使用模板库选中的卡外氛围背景" />
+                  <button class="btn btn-ghost btn-sm" data-pick="studio" type="button">浏览</button>
+                  <button class="btn btn-ghost btn-sm" data-clear="studio" type="button">清</button>
+                </div>
+                <div class="path-row">
+                  <label class="path-label" for="input-bg-path">卡内后景图</label>
+                  <input id="input-bg-path" class="text-input" type="text" placeholder="留空使用模板库选中的卡内星盘/后景" />
+                  <button class="btn btn-ghost btn-sm" data-pick="bg" type="button">浏览</button>
+                  <button class="btn btn-ghost btn-sm" data-clear="bg" type="button">清</button>
+                </div>
+                <div class="path-row">
+                  <label class="path-label" for="input-fg-path">透明前景框</label>
+                  <input id="input-fg-path" class="text-input" type="text" placeholder="留空使用模板库选中的透明烫金前景框" />
+                  <button class="btn btn-ghost btn-sm" data-pick="fg" type="button">浏览</button>
+                  <button class="btn btn-ghost btn-sm" data-clear="fg" type="button">清</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>GIF 导出设置</h2>
+                <span class="hint">48 帧共享 256 色 Median Cut 调色板</span>
+              </div>
+
+              <div class="path-picker">
+                <input id="input-output-path" class="text-input" type="text" placeholder="默认保存至原图同目录 *_holographic_card.gif" />
+                <button id="btn-pick-output" class="btn btn-ghost btn-sm" type="button">另存为</button>
+              </div>
+
+              <div class="export-metrics">
+                <label class="metric-box">
+                  <span>导出宽度 (px)</span>
+                  <input id="input-width" class="num-input" type="number" min="280" max="900" step="20" value="460" />
+                </label>
+                <label class="metric-box">
+                  <span>总帧数</span>
+                  <input id="input-frames" class="num-input" type="number" min="24" max="72" step="4" value="48" />
+                </label>
+                <label class="metric-box">
+                  <span>超采样抗锯齿</span>
+                  <select id="select-supersample" class="select-input">
+                    <option value="2" selected>2x 高清抗锯齿（推荐）</option>
+                    <option value="1">1x 极速预览</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: Visual Template Gallery -->
+          <div id="tab-gallery" class="tab-panel" role="tabpanel" hidden>
+            <div class="section-card">
+              <div class="section-head">
+                <h2>卡外摄影棚氛围背景（非纯黑渐变）</h2>
+                <span id="selected-studio-label" class="selected-tag">自动匹配</span>
+              </div>
+              <div id="gallery-studios" class="thumb-grid thumb-grid-portrait"></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>卡内深层后景模板（10 套主题）</h2>
+                <span id="selected-bg-label" class="selected-tag">自动匹配</span>
+              </div>
+              <div id="gallery-bgs" class="thumb-grid thumb-grid-portrait"></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>卡面透明烫金前景装饰框（11 套画框）</h2>
+                <span id="selected-fg-label" class="selected-tag">自动匹配</span>
+              </div>
+              <div id="gallery-fgs" class="thumb-grid thumb-grid-portrait"></div>
+            </div>
+          </div>
+
+          <!-- TAB 3: Shader, Foil, Etching & 3D Parameters -->
+          <div id="tab-tuning" class="tab-panel" role="tabpanel" hidden>
+            <div class="section-card">
+              <div class="section-head">
+                <h2>整体氛围气质（11 套主题 + 自动）</h2>
+                <span id="selected-style-label" class="selected-tag">自动匹配</span>
+              </div>
+              <div id="gallery-styles" class="thumb-grid thumb-grid-swatch"></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>全息微蚀刻光栅纹理（11 款光栅 + 自动）</h2>
+                <span id="selected-pattern-label" class="selected-tag">自动匹配</span>
+              </div>
+              <div id="gallery-patterns" class="thumb-grid thumb-grid-swatch"></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>烫金与金属倒角拉丝色系（11 款金属 + 自动）</h2>
+                <span id="selected-metal-label" class="selected-tag">自动匹配</span>
+              </div>
+              <div id="gallery-metals" class="thumb-grid thumb-grid-swatch"></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-head">
+                <h2>3D 深度立体感 · 流麻细闪 · 光影精调</h2>
+                <span class="hint">修改参数后右侧实时刷新 3D 预览</span>
+              </div>
+
+              <div class="slider-group">
+                <div class="slider-head">
+                  <label for="range-relief">3D 景深视差与立体浮雕深度</label>
+                  <output id="out-relief" for="range-relief">1.00x</output>
+                </div>
+                <input id="range-relief" type="range" min="0.4" max="1.8" step="0.05" value="1.0" />
+              </div>
+
+              <div class="slider-group">
+                <div class="slider-head">
+                  <label for="range-quicksand">卡内流麻流沙与 300 颗细闪亮片强度</label>
+                  <output id="out-quicksand" for="range-quicksand">1.00x</output>
+                </div>
+                <input id="range-quicksand" type="range" min="0.0" max="1.8" step="0.05" value="1.0" />
+              </div>
+
+              <div class="field-grid-2">
+                <div class="field-group">
+                  <label class="field-label" for="select-intensity">闪光与全息强度</label>
+                  <select id="select-intensity" class="select-input">
+                    <option value="subtle">细腻优雅 (subtle)</option>
+                    <option value="medium" selected>均衡华丽 (medium)</option>
+                    <option value="lavish">高能璀璨 (lavish)</option>
+                  </select>
+                </div>
+                <div class="field-group">
+                  <label class="field-label" for="select-line-etch">SAR 线稿微浮雕蚀刻</label>
+                  <select id="select-line-etch" class="select-input">
+                    <option value="off">关闭</option>
+                    <option value="subtle">轻盈线刻</option>
+                    <option value="medium" selected>标准 SAR 浮雕</option>
+                    <option value="strong">高反差典藏精雕</option>
+                  </select>
+                </div>
+              </div>
+
+              <label class="check-row">
+                <input id="check-dof" type="checkbox" checked />
+                <span>启用预乘 Alpha 相机空间景深（主体锐利，深层后景与近景微虚化）</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sticky Bottom Render Control Bar -->
+        <footer class="render-dock">
+          <div class="progress-meta">
+            <span id="progress-label" role="status" aria-live="polite">就绪 · 点击任意模板或参数即可在右侧实时查看 3D 效果</span>
+            <span id="progress-pct" class="progress-pct">0%</span>
+          </div>
+          <progress id="render-progress" value="0" max="100" aria-labelledby="progress-label"></progress>
+
+          <div class="dock-actions">
+            <button id="btn-render" class="btn btn-primary" type="button">✦ 开始生成 3D 全息 GIF</button>
+            <button id="btn-cancel" class="btn btn-danger" type="button" disabled>取消</button>
+            <button id="btn-reveal-output" class="btn btn-ghost" type="button" disabled>定位输出文件</button>
+          </div>
+        </footer>
+      </section>
+
+      <!-- Right Column: Live 3D WYSIWYG Preview Stage -->
+      <section class="preview-pane" aria-label="实时 3D 效果预览舞台">
+        <div class="preview-toolbar">
+          <div class="segmented" role="group" aria-label="预览内容切换">
+            <button class="seg-btn is-active" data-view="live3d" type="button">实时 3D 效果</button>
+            <button class="seg-btn" data-view="subject" type="button">原图</button>
+            <button class="seg-btn" data-view="depth" type="button">深度图</button>
+            <button class="seg-btn" data-view="gif" type="button">导出动图</button>
+          </div>
+
+          <button id="btn-refresh-preview" class="btn btn-ghost btn-sm" type="button">刷新预览</button>
+        </div>
+
+        <div id="preview-stage" class="preview-stage">
+          <div id="preview-spinner" class="preview-spinner" hidden>
+            <span class="spinner-dot" aria-hidden="true"></span>
+            <span>正在渲染 3D 实时预览帧…</span>
+          </div>
+          <img id="preview-image" class="preview-image" alt="实时 3D 全息卡片预览" />
+          <div id="preview-empty" class="preview-empty" hidden>
+            <p>暂无对应图像</p>
+          </div>
+        </div>
+
+        <div class="angle-bar" role="group" aria-label="3D 预览倾角预设">
+          <button class="angle-btn" data-angle="front" type="button">0° 正视对齐</button>
+          <button class="angle-btn is-active" data-angle="right" type="button">+17.5° 右倾流麻</button>
+          <button class="angle-btn" data-angle="left" type="button">-17.5° 左倾视差</button>
+          <button class="angle-btn" data-angle="tilt" type="button">斜仰微浮雕</button>
+        </div>
+
+        <div id="preview-meta" class="preview-meta">
+          等待连接本地渲染引擎…
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

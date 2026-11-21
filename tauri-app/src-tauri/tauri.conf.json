@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tarot Holographic Studio",
+  "version": "1.0.0",
+  "identifier": "com.tarot.holographic.studio",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "3D 全息浮雕塔罗 & SAR 流麻闪卡工作室",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 1040,
+        "minHeight": 720,
+        "resizable": true,
+        "center": true,
+        "backgroundColor": "#0F0E16"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  }
+}
